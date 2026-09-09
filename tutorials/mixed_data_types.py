@@ -60,3 +60,4 @@ classifier = TabLDMClassifier(
 )
 classifier.fit(X_train, y_train)
 predictions = classifier.predict(X_test)
+print(f"Accuracy: {accuracy_score(y_test, predictions):.3f}")

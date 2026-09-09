@@ -14,6 +14,7 @@ Example                          Demonstrates
 ===============================  =====================================================
 ``getting_started.py``           Basic classification, regression, and cross-validation
 ``mixed_data_types.py``          Numeric, categorical, boolean, and missing values
+``horse_racing_top3.py``         Compare whole-race context sizes for top-three ranking
 ``classification_metrics.py``    Labels, probabilities, and classification metrics
 ``regression_quantiles.py``      Mean predictions and predictive quantiles
 ``kv_cache.py``                  Faster repeated prediction with one training context
