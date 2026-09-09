@@ -186,6 +186,44 @@ clf = TabLDMClassifier.load("classifier.pkl")
 When `save_model_weights=False` (the default), the saved file is smaller, but the
 weights must be reloaded from `model_path` or the Hub when loading the estimator.
 
+### Experimental Horse-Racing Fine-Tuning
+
+The repository-level `finetune_tabldm.py` script provides downstream weight
+training for the supplied chronological horse-racing CSV splits. It constructs
+each episode from complete earlier context races and one later query race, and
+uses only the fields listed in `a.json`.
+
+```bash
+# Fastest/safest first experiment: train only the prediction decoder.
+python finetune_tabldm.py \
+  --finetune-mode decoder \
+  --context-races 10 \
+  --epochs 20
+
+# Small CPU smoke test without writing a checkpoint.
+python finetune_tabldm.py \
+  --device cpu \
+  --context-races 1 \
+  --epochs 1 \
+  --max-train-races 1 \
+  --max-validation-races 1 \
+  --max-test-races 1 \
+  --no-save
+```
+
+The available stages are `decoder`, `icl`, `row_icl`, and `full`. Complete
+fine-tuned checkpoints remain compatible with `TabLDMClassifier(model_path=...)`.
+Use the same feature JSON at inference time; `tutorials/horse_racing_top3.py`
+checks the adjacent checkpoint metadata when available.
+
+```bash
+python tutorials/horse_racing_top3.py \
+  --checkpoint results/tabldm_horse_finetuned.ckpt \
+  --features-json a.json \
+  --context-races 10 \
+  --n-estimators 1
+```
+
 ## Advanced Configuration
 
 Xiaomi-TabLDM provides a set of parameters for customizing inference behavior. The following

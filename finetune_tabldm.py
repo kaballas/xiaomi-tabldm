@@ -1,0 +1,569 @@
+"""Race-aware downstream fine-tuning for the Xiaomi TabLDM classifier.
+
+Each episode contains K complete earlier races as labelled in-context rows and
+one later complete race as query rows. Race IDs define chronological groups but
+are never passed to the model as features.
+"""
+
+from __future__ import annotations
+
+from argparse import ArgumentParser
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+import json
+import os
+import random
+import tempfile
+import warnings
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+
+from tabldm import InferenceConfig, TabLDMClassifier
+from tabldm._sklearn.preprocessing import EnsembleGenerator, TransformToNumerical
+from tutorials.horse_racing_top3 import read_feature_columns
+
+
+ROOT = Path(__file__).resolve().parent
+TARGET = "top3_mask"
+
+
+@dataclass
+class Race:
+    race_id: str
+    start_time: pd.Timestamp
+    frame: pd.DataFrame
+    y: np.ndarray
+    winner: np.ndarray
+
+
+@dataclass
+class Episode:
+    race_id: str
+    X_context: np.ndarray
+    y_context: np.ndarray
+    context_sizes: tuple[int, ...]
+    X_query: np.ndarray
+    y_query: np.ndarray
+    winner_query: np.ndarray
+
+
+def positive_integer(value):
+    value = int(value)
+    if value < 1:
+        raise ValueError("value must be at least 1")
+    return value
+
+
+def positive_float(value):
+    value = float(value)
+    if value <= 0:
+        raise ValueError("value must be greater than zero")
+    return value
+
+
+def nonnegative_float(value):
+    value = float(value)
+    if value < 0:
+        raise ValueError("value must be non-negative")
+    return value
+
+
+def parse_args():
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", type=Path, default=os.environ.get("TABLDM_CLF_CKPT"))
+    parser.add_argument("--train-csv", type=Path, default=ROOT / "data/train.csv")
+    parser.add_argument("--validation-csv", type=Path, default=ROOT / "data/validation.csv")
+    parser.add_argument("--test-csv", type=Path, default=ROOT / "data/test.csv")
+    parser.add_argument("--features-json", type=Path, default=ROOT / "a.json")
+    parser.add_argument("--output", type=Path, default=ROOT / "results/tabldm_horse_finetuned.ckpt")
+    parser.add_argument("--finetune-mode", choices=("decoder", "icl", "row_icl", "full"), default="decoder")
+    parser.add_argument("--context-races", type=positive_integer, default=10)
+    parser.add_argument("--epochs", type=positive_integer, default=20)
+    parser.add_argument("--learning-rate", type=positive_float, default=None)
+    parser.add_argument("--weight-decay", type=nonnegative_float, default=1e-4)
+    parser.add_argument("--gradient-accumulation", type=positive_integer, default=4)
+    parser.add_argument("--grad-clip", type=nonnegative_float, default=1.0)
+    parser.add_argument("--listwise-weight", type=nonnegative_float, default=0.0)
+    parser.add_argument("--moe-aux-weight", type=nonnegative_float, default=1.0)
+    parser.add_argument("--patience", type=positive_integer, default=4)
+    parser.add_argument("--min-delta", type=nonnegative_float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--num-threads", type=positive_integer, default=None)
+    parser.add_argument("--max-train-races", type=positive_integer, default=None)
+    parser.add_argument("--max-validation-races", type=positive_integer, default=None)
+    parser.add_argument("--max-test-races", type=positive_integer, default=None)
+    parser.add_argument("--no-runner-shuffle", action="store_true")
+    parser.add_argument("--no-save", action="store_true")
+    return parser.parse_args()
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def resolve_device(requested):
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but torch.cuda.is_available() is false")
+    return device
+
+
+def load_races(csv_path, feature_columns):
+    frame = pd.read_csv(csv_path, low_memory=False)
+    required = {"race_id", "start_time_iso", "runner_mask", TARGET, "is_winner", *feature_columns}
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(f"{csv_path} is missing required columns: {missing}")
+
+    races = []
+    for race_id, group in frame.groupby("race_id", sort=False):
+        active = group.loc[group["runner_mask"].eq(1)].copy().reset_index(drop=True)
+        if active.empty or active[TARGET].isna().any():
+            continue
+        labels = active[TARGET].astype(int).to_numpy()
+        winner = active["is_winner"].astype(int).to_numpy()
+        if set(np.unique(labels)) != {0, 1} or int(labels.sum()) != 3 or int(winner.sum()) != 1:
+            continue
+        start_time = pd.to_datetime(active["start_time_iso"].iloc[0], utc=True, errors="raise")
+        races.append(Race(str(race_id), start_time, active, labels, winner))
+
+    races.sort(key=lambda race: (race.start_time, race.race_id))
+    if not races:
+        raise ValueError(f"No eligible labelled races found in {csv_path}")
+    return races, frame.columns
+
+
+def validate_chronology(train_races, validation_races, test_races):
+    if train_races[-1].start_time >= validation_races[0].start_time:
+        raise ValueError("Training races are not strictly earlier than validation races")
+    if validation_races[-1].start_time >= test_races[0].start_time:
+        raise ValueError("Validation races are not strictly earlier than test races")
+
+
+def episode_specs(query_races, initial_history, context_races, limit=None):
+    history = list(initial_history)
+    specs = []
+    position = 0
+    while position < len(query_races):
+        start_time = query_races[position].start_time
+        end = position
+        while end < len(query_races) and query_races[end].start_time == start_time:
+            end += 1
+        simultaneous_races = query_races[position:end]
+        for query in simultaneous_races:
+            if len(history) >= context_races:
+                specs.append((tuple(history[-context_races:]), query))
+                if limit is not None and len(specs) >= limit:
+                    return specs
+        # Results from simultaneous races become history only after all queries
+        # at that start time have been constructed.
+        history.extend(simultaneous_races)
+        position = end
+    return specs
+
+
+def prepare_episode(context_races, query_race, feature_columns):
+    context_frame = pd.concat([race.frame for race in context_races], ignore_index=True)
+    context_y = np.concatenate([race.y for race in context_races])
+    context_sizes = tuple(len(race.frame) for race in context_races)
+
+    # Match the public classifier: fit string encoding, constant filtering and
+    # scaling on labelled context only, then apply them to the later query.
+    encoder = TransformToNumerical()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="The following categorical columns have a cardinality above 40")
+        warnings.filterwarnings("ignore", message="Skipping features without any observed values")
+        X_context = encoder.fit_transform(context_frame.loc[:, feature_columns])
+        X_query = encoder.transform(query_race.frame.loc[:, feature_columns])
+
+    generator = EnsembleGenerator(
+        classification=True,
+        n_estimators=1,
+        norm_methods="none",
+        feat_shuffle_method="none",
+        class_shuffle_method="none",
+        random_state=0,
+    )
+    generator.fit(X_context, context_y)
+    generated = generator.transform(X_query, mode="both")
+    X_all, y_ensemble = next(iter(generated.values()))
+    X_all = np.asarray(X_all[0], dtype=np.float32)
+    y_context = np.asarray(y_ensemble[0], dtype=np.int64)
+
+    if not np.isfinite(X_all).all():
+        raise ValueError(f"Preprocessing produced non-finite values for query race {query_race.race_id}")
+    split = len(context_y)
+    return Episode(
+        race_id=query_race.race_id,
+        X_context=X_all[:split],
+        y_context=y_context,
+        context_sizes=context_sizes,
+        X_query=X_all[split:],
+        y_query=query_race.y.astype(np.int64),
+        winner_query=query_race.winner.astype(np.int64),
+    )
+
+
+def prepare_episodes(specs, feature_columns, label):
+    episodes = []
+    for index, (context, query) in enumerate(specs, start=1):
+        episodes.append(prepare_episode(context, query, feature_columns))
+        if index % 50 == 0 or index == len(specs):
+            print(f"Prepared {label} episodes: {index}/{len(specs)}")
+    return episodes
+
+
+def load_model(checkpoint_path, device):
+    loader = TabLDMClassifier(
+        model_path=checkpoint_path,
+        checkpoint_version="checkpoints/clf_default.ckpt",
+        allow_auto_download=True,
+        device=device,
+    )
+    loader._load_model()
+    model = loader.model_.to(device)
+    source_path = Path(loader.model_path_)
+    source_checkpoint = torch.load(source_path, map_location="cpu", weights_only=True)
+    return model, source_checkpoint, source_path
+
+
+def configure_finetuning(model, mode):
+    model.requires_grad_(False)
+    if mode == "decoder":
+        modules = [model.icl_predictor.decoder]
+    elif mode == "icl":
+        modules = [model.icl_predictor]
+    elif mode == "row_icl":
+        modules = [model.row_interactor, model.icl_predictor]
+    else:
+        modules = [model]
+    for module in modules:
+        module.requires_grad_(True)
+
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable:
+        raise RuntimeError(f"Fine-tune mode {mode} selected no parameters")
+    return trainable
+
+
+def shuffled_episode_arrays(episode, rng, shuffle_runners):
+    if not shuffle_runners:
+        return episode.X_context, episode.y_context, episode.X_query, episode.y_query
+
+    context_indices = []
+    offset = 0
+    for size in episode.context_sizes:
+        context_indices.extend((offset + rng.permutation(size)).tolist())
+        offset += size
+    query_indices = rng.permutation(len(episode.y_query))
+    return (
+        episode.X_context[context_indices],
+        episode.y_context[context_indices],
+        episode.X_query[query_indices],
+        episode.y_query[query_indices],
+    )
+
+
+def episode_tensors(episode, device, rng=None, shuffle_runners=False):
+    X_context, y_context, X_query, y_query = shuffled_episode_arrays(episode, rng, shuffle_runners)
+    X = torch.from_numpy(np.concatenate([X_context, X_query], axis=0)).unsqueeze(0).to(device)
+    y_context_tensor = torch.from_numpy(y_context).unsqueeze(0).to(device=device, dtype=torch.float32)
+    y_query_tensor = torch.from_numpy(y_query).unsqueeze(0).to(device=device, dtype=torch.long)
+    return X, y_context_tensor, y_query_tensor
+
+
+def task_loss(logits, targets, listwise_weight):
+    active_logits = logits[..., :2]
+    cross_entropy = F.cross_entropy(active_logits.reshape(-1, 2), targets.reshape(-1))
+    if listwise_weight == 0:
+        return cross_entropy, cross_entropy, cross_entropy.new_zeros(())
+
+    positive_scores = active_logits[..., 1] - active_logits[..., 0]
+    target_distribution = targets.float() / targets.sum(dim=1, keepdim=True).clamp_min(1)
+    listwise = -(target_distribution * F.log_softmax(positive_scores, dim=1)).sum(dim=1).mean()
+    return cross_entropy + listwise_weight * listwise, cross_entropy, listwise
+
+
+def optimizer_step(optimizer, trainable_parameters, accumulated, grad_clip):
+    for parameter in trainable_parameters:
+        if parameter.grad is not None:
+            parameter.grad.div_(accumulated)
+    if grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(trainable_parameters, grad_clip)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+
+def train_epoch(model, episodes, optimizer, trainable_parameters, args, epoch):
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    rng = np.random.default_rng(args.seed + epoch)
+    order = rng.permutation(len(episodes))
+    objective_losses = []
+    cross_entropy_losses = []
+    listwise_losses = []
+    auxiliary_losses = []
+    accumulated = 0
+
+    for position, episode_index in enumerate(order, start=1):
+        episode = episodes[episode_index]
+        X, y_context, y_query = episode_tensors(
+            episode,
+            args.resolved_device,
+            rng=rng,
+            shuffle_runners=not args.no_runner_shuffle,
+        )
+        logits = model(X, y_train=y_context, embed_with_test=False)
+        loss, cross_entropy, listwise = task_loss(logits, y_query, args.listwise_weight)
+        auxiliary = loss.new_zeros(())
+        if args.finetune_mode != "decoder" and args.moe_aux_weight > 0:
+            auxiliary = model.moe_aux_loss()
+            loss = loss + args.moe_aux_weight * auxiliary
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite training loss for query race {episode.race_id}")
+        loss.backward()
+        objective_losses.append(float(loss.detach()))
+        cross_entropy_losses.append(float(cross_entropy.detach()))
+        listwise_losses.append(float(listwise.detach()))
+        auxiliary_losses.append(float(auxiliary.detach()))
+        accumulated += 1
+
+        if accumulated == args.gradient_accumulation or position == len(order):
+            optimizer_step(optimizer, trainable_parameters, accumulated, args.grad_clip)
+            accumulated = 0
+    return {
+        "objective": float(np.mean(objective_losses)),
+        "cross_entropy": float(np.mean(cross_entropy_losses)),
+        "listwise": float(np.mean(listwise_losses)),
+        "moe_aux": float(np.mean(auxiliary_losses)),
+    }
+
+
+def build_inference_config(device):
+    config = InferenceConfig()
+    common = {"device": device, "use_amp": False, "use_fa3": False}
+    config.update_from_dict(
+        {
+            "COL_CONFIG": dict(common),
+            "ROW_CONFIG": dict(common),
+            "ICL_CONFIG": dict(common),
+        }
+    )
+    return config
+
+
+@torch.no_grad()
+def evaluate(model, episodes, device, inference_config):
+    model.eval()
+    log_losses = []
+    top1_winner = []
+    winner_in_top3 = []
+    top3_recalls = []
+    exact_top3 = []
+
+    for episode in episodes:
+        X, y_context, y_query = episode_tensors(episode, device)
+        logits = model(
+            X,
+            y_train=y_context,
+            embed_with_test=False,
+            inference_config=inference_config,
+        )[..., :2]
+        log_losses.append(float(F.cross_entropy(logits.reshape(-1, 2), y_query.reshape(-1))))
+        scores = (logits[0, :, 1] - logits[0, :, 0]).cpu().numpy()
+        ranked = np.argsort(-scores, kind="stable")
+        selected = set(ranked[:3].tolist())
+        actual_top3 = set(np.flatnonzero(episode.y_query == 1).tolist())
+        winner_index = int(np.flatnonzero(episode.winner_query == 1)[0])
+        top1_winner.append(float(ranked[0] == winner_index))
+        winner_in_top3.append(float(winner_index in selected))
+        top3_recalls.append(len(selected.intersection(actual_top3)) / 3)
+        exact_top3.append(float(selected == actual_top3))
+
+    return {
+        "race_log_loss": float(np.mean(log_losses)),
+        "top1_winner_accuracy": float(np.mean(top1_winner)),
+        "winner_in_top3": float(np.mean(winner_in_top3)),
+        "top3_recall": float(np.mean(top3_recalls)),
+        "exact_top3_rate": float(np.mean(exact_top3)),
+        "races": len(episodes),
+    }
+
+
+def format_metrics(metrics):
+    return (
+        f"loss={metrics['race_log_loss']:.4f} "
+        f"winner@1={metrics['top1_winner_accuracy']:.3f} "
+        f"winner@3={metrics['winner_in_top3']:.3f} "
+        f"top3_recall={metrics['top3_recall']:.3f} "
+        f"exact_top3={metrics['exact_top3_rate']:.3f} "
+        f"races={metrics['races']}"
+    )
+
+
+def save_trainable_parameters(model, path):
+    state = {
+        name: parameter.detach().cpu()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    torch.save(state, path)
+
+
+def restore_trainable_parameters(model, path):
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    parameters = dict(model.named_parameters())
+    with torch.no_grad():
+        for name, value in state.items():
+            parameters[name].copy_(value.to(parameters[name].device))
+
+
+def save_finetuned_checkpoint(model, source_checkpoint, output_path, metadata):
+    checkpoint = {
+        "config": source_checkpoint["config"],
+        "dual_stream_config": source_checkpoint.get("dual_stream_config", {}),
+        "state_dict": {name: value.detach().cpu() for name, value in model.state_dict().items()},
+        "fine_tuning": metadata,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(checkpoint, output_path)
+    metadata_path = output_path.with_suffix(output_path.suffix + ".json")
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+
+def main():
+    args = parse_args()
+    seed_everything(args.seed)
+    args.resolved_device = resolve_device(args.device)
+    if args.num_threads is not None:
+        torch.set_num_threads(args.num_threads)
+    if args.learning_rate is None:
+        args.learning_rate = 1e-4 if args.finetune_mode == "decoder" else 1e-5
+
+    train_header = pd.read_csv(args.train_csv, nrows=0).columns
+    feature_columns = read_feature_columns(args.features_json, train_header)
+    train_races, train_columns = load_races(args.train_csv, feature_columns)
+    validation_races, validation_columns = load_races(args.validation_csv, feature_columns)
+    test_races, test_columns = load_races(args.test_csv, feature_columns)
+    if list(train_columns) != list(validation_columns) or list(train_columns) != list(test_columns):
+        raise ValueError("Train, validation and test CSV schemas do not match")
+    validate_chronology(train_races, validation_races, test_races)
+
+    train_specs = episode_specs(train_races, [], args.context_races, args.max_train_races)
+    validation_specs = episode_specs(
+        validation_races, train_races, args.context_races, args.max_validation_races
+    )
+    test_specs = episode_specs(
+        test_races, train_races + validation_races, args.context_races, args.max_test_races
+    )
+    if not train_specs or not validation_specs or not test_specs:
+        raise ValueError("Each split must produce at least one race episode")
+
+    print(
+        f"Chronological races: train={len(train_races)}, validation={len(validation_races)}, "
+        f"test={len(test_races)}; context={args.context_races} race(s)"
+    )
+    print(f"Configured features: {len(feature_columns)} from {args.features_json}")
+    train_episodes = prepare_episodes(train_specs, feature_columns, "training")
+    validation_episodes = prepare_episodes(validation_specs, feature_columns, "validation")
+    test_episodes = prepare_episodes(test_specs, feature_columns, "test")
+
+    model, source_checkpoint, source_path = load_model(args.checkpoint, args.resolved_device)
+    trainable_parameters = configure_finetuning(model, args.finetune_mode)
+    inference_config = build_inference_config(args.resolved_device)
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    trainable_count = sum(parameter.numel() for parameter in trainable_parameters)
+    print(f"Checkpoint: {source_path}")
+    print(
+        f"Device: {args.resolved_device}; mode={args.finetune_mode}; "
+        f"trainable={trainable_count:,}/{total_parameters:,} parameters ({trainable_count / total_parameters:.2%})"
+    )
+
+    optimizer = torch.optim.AdamW(trainable_parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
+    history = []
+    baseline_validation = evaluate(model, validation_episodes, args.resolved_device, inference_config)
+    baseline_test = evaluate(model, test_episodes, args.resolved_device, inference_config)
+    print(f"Pretrained validation: {format_metrics(baseline_validation)}")
+    print(f"Pretrained test:       {format_metrics(baseline_test)}")
+    best_loss = baseline_validation["race_log_loss"]
+    best_epoch = 0
+    stale_epochs = 0
+
+    with tempfile.TemporaryDirectory(prefix="tabldm-finetune-") as temporary_directory:
+        best_parameters_path = Path(temporary_directory) / "best-trainable.pt"
+        save_trainable_parameters(model, best_parameters_path)
+        for epoch in range(1, args.epochs + 1):
+            train_metrics = train_epoch(model, train_episodes, optimizer, trainable_parameters, args, epoch)
+            validation_metrics = evaluate(
+                model, validation_episodes, args.resolved_device, inference_config
+            )
+            history.append({"epoch": epoch, "train": train_metrics, "validation": validation_metrics})
+            print(
+                f"Epoch {epoch:03d}: train_objective={train_metrics['objective']:.4f} "
+                f"ce={train_metrics['cross_entropy']:.4f} "
+                f"listwise={train_metrics['listwise']:.4f} aux={train_metrics['moe_aux']:.4f}; "
+                f"val {format_metrics(validation_metrics)}"
+            )
+
+            if validation_metrics["race_log_loss"] < best_loss - args.min_delta:
+                best_loss = validation_metrics["race_log_loss"]
+                best_epoch = epoch
+                stale_epochs = 0
+                save_trainable_parameters(model, best_parameters_path)
+            else:
+                stale_epochs += 1
+                if stale_epochs >= args.patience:
+                    print(f"Early stopping after {epoch} epochs")
+                    break
+
+        restore_trainable_parameters(model, best_parameters_path)
+
+    final_validation = evaluate(model, validation_episodes, args.resolved_device, inference_config)
+    final_test = evaluate(model, test_episodes, args.resolved_device, inference_config)
+    print(f"Selected checkpoint epoch: {best_epoch} (0 means untouched pretrained weights)")
+    print(f"Best validation: {format_metrics(final_validation)}")
+    print(f"Sealed test:     {format_metrics(final_test)}")
+
+    metadata = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source_checkpoint": str(source_path),
+        "target": TARGET,
+        "feature_config": str(args.features_json),
+        "features": feature_columns,
+        "preprocessing": "per-episode context-fitted, normalization=none, no feature/class shuffle",
+        "finetune_mode": args.finetune_mode,
+        "context_races": args.context_races,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "listwise_weight": args.listwise_weight,
+        "moe_aux_weight": args.moe_aux_weight,
+        "seed": args.seed,
+        "epochs_completed": len(history),
+        "best_epoch": best_epoch,
+        "history": history,
+        "pretrained_validation": baseline_validation,
+        "pretrained_test": baseline_test,
+        "validation": final_validation,
+        "test": final_test,
+    }
+    if args.no_save:
+        print("Checkpoint saving disabled by --no-save")
+    else:
+        save_finetuned_checkpoint(model, source_checkpoint, args.output, metadata)
+        print(f"Saved fine-tuned checkpoint: {args.output}")
+        print(f"Saved training metadata: {args.output.with_suffix(args.output.suffix + '.json')}")
+
+
+if __name__ == "__main__":
+    main()

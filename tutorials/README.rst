@@ -21,6 +21,11 @@ Example                          Demonstrates
 ``local_checkpoint.py``          Local checkpoint loading and CPU/CUDA selection
 ===============================  =====================================================
 
+The horse-racing example reads its ordered model feature list from ``a.json``
+at the repository root. Pass ``--features-json`` to use a different JSON file.
+The repository-level ``finetune_tabldm.py`` script uses the same configuration
+for experimental race-aware downstream weight training.
+
 Checkpoint locations
 --------------------
 

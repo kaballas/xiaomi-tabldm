@@ -12,10 +12,14 @@ Use the first 10 eligible races starting at the requested context race::
 Compare several nested context sizes against the same prediction race::
 
     python tutorials/horse_racing_top3.py --context-races 1 2 5 10
+
+Only columns listed in ``a.json`` are passed to the model. Use another feature
+configuration with ``--features-json /path/to/features.json``.
 """
 
 from argparse import ArgumentParser
 from pathlib import Path
+import json
 import os
 import sys
 
@@ -48,8 +52,6 @@ EXCLUDED_COLUMNS = {
     "rank_label",
     TARGET,
     "is_winner",
-    # This is an exact duplicate of last_six in the supplied CSVs.
-    "form_fig",
 }
 
 
@@ -64,6 +66,18 @@ def parse_args():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--context-csv", type=Path, default=REPO_ROOT / "data/train.csv")
     parser.add_argument("--prediction-csv", type=Path, default=REPO_ROOT / "data/validation.csv")
+    parser.add_argument(
+        "--features-json",
+        type=Path,
+        default=REPO_ROOT / "a.json",
+        help="JSON file containing the ordered 'features' array",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=os.environ.get("TABLDM_CLF_CKPT"),
+        help="base or fine-tuned classifier checkpoint",
+    )
     parser.add_argument(
         "--context-races",
         type=positive_integer,
@@ -90,6 +104,53 @@ def read_csv(csv_path):
     if missing:
         raise ValueError(f"{csv_path} is missing required columns: {sorted(missing)}")
     return frame
+
+
+def read_feature_columns(json_path, available_columns):
+    try:
+        with json_path.open(encoding="utf-8") as file:
+            config = json.load(file)
+    except FileNotFoundError as error:
+        raise ValueError(f"Feature configuration does not exist: {json_path}") from error
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid JSON in {json_path}: {error}") from error
+
+    if not isinstance(config, dict) or "features" not in config:
+        raise ValueError(f"{json_path} must contain an object with a 'features' array")
+    features = config["features"]
+    if not isinstance(features, list) or not features:
+        raise ValueError(f"{json_path} 'features' must be a non-empty array")
+    if any(not isinstance(feature, str) or not feature for feature in features):
+        raise ValueError(f"Every entry in {json_path} 'features' must be a non-empty string")
+
+    duplicates = sorted({feature for feature in features if features.count(feature) > 1})
+    if duplicates:
+        raise ValueError(f"Duplicate configured features: {duplicates}")
+    excluded = sorted(set(features).intersection(EXCLUDED_COLUMNS))
+    if excluded:
+        raise ValueError(f"Configured features include excluded/leaking columns: {excluded}")
+    missing = sorted(set(features).difference(available_columns))
+    if missing:
+        raise ValueError(f"Configured features are absent from the CSV schema: {missing}")
+    return features
+
+
+def validate_checkpoint_features(checkpoint_path, configured_features):
+    if checkpoint_path is None:
+        return
+    checkpoint_path = Path(checkpoint_path)
+    metadata_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".json")
+    if not metadata_path.exists():
+        return
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid checkpoint metadata JSON in {metadata_path}: {error}") from error
+    checkpoint_features = metadata.get("features")
+    if checkpoint_features is not None and checkpoint_features != configured_features:
+        raise ValueError(
+            f"Feature configuration does not match fine-tuned checkpoint metadata: {metadata_path}"
+        )
 
 
 def active_race(frame, race_id):
@@ -178,8 +239,8 @@ def text_overlap_stats(context, prediction, show_details=False):
     return len(text_columns), varying_count, known_rate
 
 
-def run_prediction(context, prediction, args, show_text_details=False):
-    feature_columns = [column for column in context.columns if column not in EXCLUDED_COLUMNS]
+def run_prediction(context, prediction, configured_features, args, show_text_details=False):
+    feature_columns = list(configured_features)
     all_missing_columns = [
         column
         for column in feature_columns
@@ -198,7 +259,7 @@ def run_prediction(context, prediction, args, show_text_details=False):
     classifier = TabLDMClassifier(
         n_estimators=args.n_estimators,
         device=args.device,
-        model_path=os.environ.get("TABLDM_CLF_CKPT"),
+        model_path=args.checkpoint,
         checkpoint_version="checkpoints/clf_default.ckpt",
     )
     classifier.fit(X_context, y_context)
@@ -249,6 +310,8 @@ def main():
     prediction_source = read_csv(args.prediction_csv)
     if list(context_source.columns) != list(prediction_source.columns):
         raise ValueError("Context and prediction CSV schemas do not match")
+    configured_features = read_feature_columns(args.features_json, context_source.columns)
+    validate_checkpoint_features(args.checkpoint, configured_features)
 
     prediction, prediction_inactive = active_race(prediction_source, args.prediction_race_id)
     if len(prediction) < 3:
@@ -270,6 +333,7 @@ def main():
     )
     print(f"Context starts at {args.context_race_id}; comparing race counts: {context_counts}")
     print("race_id defines whole-race boundaries and is excluded from model features.")
+    print(f"Configured features: {len(configured_features)} from {args.features_json}")
 
     summaries = []
     largest_result = None
@@ -288,6 +352,7 @@ def main():
         result, summary = run_prediction(
             context,
             prediction,
+            configured_features,
             args,
             show_text_details=context_count == max(context_counts),
         )
