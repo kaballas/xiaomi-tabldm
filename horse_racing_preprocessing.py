@@ -17,8 +17,10 @@ def _to_numerical(context, query):
 
     if numeric_columns:
         imputer = SimpleImputer()
-        context_parts.append(imputer.fit_transform(context.loc[:, numeric_columns]))
-        query_parts.append(imputer.transform(query.loc[:, numeric_columns]))
+        context_numeric = context.loc[:, numeric_columns].to_numpy(copy=False)
+        query_numeric = query.loc[:, numeric_columns].to_numpy(copy=False)
+        context_parts.append(imputer.fit_transform(context_numeric))
+        query_parts.append(imputer.transform(query_numeric))
     if categorical_columns:
         encoder = OrdinalEncoder(
             dtype=np.int64,
@@ -26,8 +28,10 @@ def _to_numerical(context, query):
             unknown_value=-1,
             encoded_missing_value=-1,
         )
-        context_parts.append(encoder.fit_transform(context.loc[:, categorical_columns]))
-        query_parts.append(encoder.transform(query.loc[:, categorical_columns]))
+        context_categorical = context.loc[:, categorical_columns].to_numpy(copy=False)
+        query_categorical = query.loc[:, categorical_columns].to_numpy(copy=False)
+        context_parts.append(encoder.fit_transform(context_categorical))
+        query_parts.append(encoder.transform(query_categorical))
 
     if not context_parts:
         raise ValueError("No supported numeric or categorical feature columns were found")

@@ -68,8 +68,10 @@ def test_fast_preprocessing_matches_original_pipeline_with_mixed_features():
     features = list(context.columns)
     y_context = np.array([0, 1, 0, 1, 0, 1])
 
-    expected = reference_episode_features(context, query, features, y_context)
-    actual = preprocess_episode_features(context, query, features)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        expected = reference_episode_features(context, query, features, y_context)
+        actual = preprocess_episode_features(context, query, features)
 
     np.testing.assert_array_equal(actual, expected)
 
@@ -85,7 +87,9 @@ def test_fast_preprocessing_matches_original_outlier_clipping():
     features = list(context.columns)
     y_context = np.arange(len(context)) % 2
 
-    expected = reference_episode_features(context, query, features, y_context)
-    actual = preprocess_episode_features(context, query, features)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        expected = reference_episode_features(context, query, features, y_context)
+        actual = preprocess_episode_features(context, query, features)
 
     np.testing.assert_array_equal(actual, expected)

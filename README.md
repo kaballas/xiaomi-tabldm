@@ -278,6 +278,7 @@ to the initial rate:
 ```bash
 python train_tabldm_from_scratch.py \
   --dataset Kaballas/races \
+  --preprocessing-workers 4 \
   --batch-size 8 \
   --learning-rate 3e-4 \
   --min-learning-rate 3e-4 \
@@ -290,6 +291,8 @@ Hugging Face dataset cache. `test.csv` is downloaded only when
 and `--validation-csv` (and `--test-csv` when evaluating the test split).
 `--batch-size` stacks episodes with matching context, query, and feature
 dimensions; smaller incompatible groups are processed as partial batches.
+Episode preparation uses up to four CPU processes by default; tune this with
+`--preprocessing-workers`, or pass `1` for serial preprocessing.
 
 The default output is
 `results/tabldm_horse_from_scratch.ckpt`, accompanied by a JSON metadata file.

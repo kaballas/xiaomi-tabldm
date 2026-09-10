@@ -10,6 +10,7 @@ from __future__ import annotations
 from argparse import ArgumentParser
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import multiprocessing
 from pathlib import Path
 import json
 import os
@@ -119,6 +120,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num-threads", type=positive_integer, default=None)
+    parser.add_argument(
+        "--preprocessing-workers",
+        type=positive_integer,
+        default=min(4, os.cpu_count() or 1),
+        help="CPU processes used to prepare race episodes",
+    )
     parser.add_argument("--max-train-races", type=positive_integer, default=None)
     parser.add_argument("--max-validation-races", type=positive_integer, default=None)
     parser.add_argument("--max-test-races", type=positive_integer, default=None)
@@ -243,12 +250,49 @@ def prepare_episode(context_races, query_race, feature_columns):
     )
 
 
-def prepare_episodes(specs, feature_columns, label):
+_PREPROCESSING_SPECS = None
+_PREPROCESSING_FEATURE_COLUMNS = None
+
+
+def _prepare_episode_at_index(index):
+    context, query = _PREPROCESSING_SPECS[index]
+    return prepare_episode(context, query, _PREPROCESSING_FEATURE_COLUMNS)
+
+
+def prepare_episodes(specs, feature_columns, label, workers=1):
+    worker_count = min(workers, len(specs))
+    if worker_count > 1:
+        try:
+            context = multiprocessing.get_context("fork")
+        except ValueError:
+            worker_count = 1
+
+    if worker_count == 1:
+        iterator = (
+            prepare_episode(context_races, query_race, feature_columns)
+            for context_races, query_race in specs
+        )
+        pool = None
+    else:
+        global _PREPROCESSING_SPECS, _PREPROCESSING_FEATURE_COLUMNS
+        _PREPROCESSING_SPECS = specs
+        _PREPROCESSING_FEATURE_COLUMNS = feature_columns
+        pool = context.Pool(processes=worker_count)
+        chunk_size = max(1, min(32, len(specs) // (worker_count * 8)))
+        iterator = pool.imap(_prepare_episode_at_index, range(len(specs)), chunksize=chunk_size)
+
     episodes = []
-    for index, (context, query) in enumerate(specs, start=1):
-        episodes.append(prepare_episode(context, query, feature_columns))
-        if index % 50 == 0 or index == len(specs):
-            print(f"Prepared {label} episodes: {index}/{len(specs)}")
+    try:
+        for index, episode in enumerate(iterator, start=1):
+            episodes.append(episode)
+            if index % 50 == 0 or index == len(specs):
+                print(f"Prepared {label} episodes: {index}/{len(specs)}")
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
+            _PREPROCESSING_SPECS = None
+            _PREPROCESSING_FEATURE_COLUMNS = None
     return episodes
 
 
@@ -564,8 +608,6 @@ def save_finetuned_checkpoint(model, source_checkpoint, output_path, metadata):
 
 def main():
     args = parse_args()
-    seed_everything(args.seed)
-    args.resolved_device = resolve_device(args.device)
     if args.num_threads is not None:
         torch.set_num_threads(args.num_threads)
     if args.learning_rate is None:
@@ -608,12 +650,21 @@ def main():
         split_summary += f", test={len(test_races)}"
     print(f"Chronological races: {split_summary}; context={args.context_races} race(s)")
     print(f"Configured features: {len(feature_columns)} from {args.features_json}")
-    train_episodes = prepare_episodes(train_specs, feature_columns, "training")
-    validation_episodes = prepare_episodes(validation_specs, feature_columns, "validation")
+    print(f"Episode preprocessing workers: {args.preprocessing_workers}")
+    train_episodes = prepare_episodes(
+        train_specs, feature_columns, "training", args.preprocessing_workers
+    )
+    validation_episodes = prepare_episodes(
+        validation_specs, feature_columns, "validation", args.preprocessing_workers
+    )
     test_episodes = (
-        prepare_episodes(test_specs, feature_columns, "test") if test_specs is not None else None
+        prepare_episodes(test_specs, feature_columns, "test", args.preprocessing_workers)
+        if test_specs is not None
+        else None
     )
 
+    seed_everything(args.seed)
+    args.resolved_device = resolve_device(args.device)
     model, source_checkpoint, source_path = load_model(args.checkpoint, args.resolved_device)
     trainable_parameters = configure_finetuning(model, args.finetune_mode)
     inference_config = build_inference_config(args.resolved_device)
@@ -683,6 +734,7 @@ def main():
         "preprocessing": "per-episode context-fitted, normalization=none, no feature/class shuffle",
         "finetune_mode": args.finetune_mode,
         "context_races": args.context_races,
+        "preprocessing_workers": args.preprocessing_workers,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "listwise_weight": args.listwise_weight,

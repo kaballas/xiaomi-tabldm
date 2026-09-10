@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import json
 import math
+import os
 import tempfile
 
 import pandas as pd
@@ -142,6 +143,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num-threads", type=positive_integer, default=None)
+    parser.add_argument(
+        "--preprocessing-workers",
+        type=positive_integer,
+        default=min(4, os.cpu_count() or 1),
+        help="CPU processes used to prepare race episodes",
+    )
     parser.add_argument("--max-train-races", type=positive_integer, default=None)
     parser.add_argument("--max-validation-races", type=positive_integer, default=None)
     parser.add_argument("--max-test-races", type=positive_integer, default=None)
@@ -284,8 +291,6 @@ def save_scratch_checkpoint(model, config, output_path, metadata):
 def main():
     args = parse_args()
     validate_model_args(args)
-    seed_everything(args.seed)
-    args.resolved_device = resolve_device(args.device)
     # train_epoch shares this flag with the fine-tuning entry point. "full"
     # enables MoE auxiliary loss because every scratch parameter is trainable.
     args.finetune_mode = "full"
@@ -332,12 +337,21 @@ def main():
         split_summary += f", test={len(test_races)}"
     print(f"Chronological races: {split_summary}; context={args.context_races} race(s)")
     print(f"Configured features: {len(feature_columns)} from {args.features_json}")
-    train_episodes = prepare_episodes(train_specs, feature_columns, "training")
-    validation_episodes = prepare_episodes(validation_specs, feature_columns, "validation")
+    print(f"Episode preprocessing workers: {args.preprocessing_workers}")
+    train_episodes = prepare_episodes(
+        train_specs, feature_columns, "training", args.preprocessing_workers
+    )
+    validation_episodes = prepare_episodes(
+        validation_specs, feature_columns, "validation", args.preprocessing_workers
+    )
     test_episodes = (
-        prepare_episodes(test_specs, feature_columns, "test") if test_specs is not None else None
+        prepare_episodes(test_specs, feature_columns, "test", args.preprocessing_workers)
+        if test_specs is not None
+        else None
     )
 
+    seed_everything(args.seed)
+    args.resolved_device = resolve_device(args.device)
     model, model_config = build_model(args, args.resolved_device)
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
@@ -451,6 +465,7 @@ def main():
         "model_config": model_config,
         "context_races": args.context_races,
         "batch_size": args.batch_size,
+        "preprocessing_workers": args.preprocessing_workers,
         "learning_rate": args.learning_rate,
         "min_learning_rate": args.min_learning_rate,
         "warmup_epochs": args.warmup_epochs,
