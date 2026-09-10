@@ -195,18 +195,20 @@ feature.
 
 #### Fine-tuning a pretrained checkpoint
 
-`finetune_tabldm.py` provides downstream weight training for the supplied
-chronological horse-racing CSV splits.
+`finetune_tabldm.py` provides downstream weight training using chronological
+horse-racing splits from `Kaballas/races` by default.
 
 ```bash
 # Fastest/safest first experiment: train only the prediction decoder.
 python finetune_tabldm.py \
+  --dataset Kaballas/races \
   --finetune-mode decoder \
   --context-races 10 \
   --epochs 20
 
 # Small CPU smoke test without writing a checkpoint.
 python finetune_tabldm.py \
+  --dataset Kaballas/races \
   --device cpu \
   --context-races 1 \
   --epochs 1 \
@@ -319,6 +321,7 @@ learned during scratch training:
 
 ```bash
 python finetune_tabldm.py \
+  --dataset Kaballas/races \
   --checkpoint results/tabldm_horse_from_scratch.ckpt \
   --output results/tabldm_horse_scratch_finetuned.ckpt \
   --device cpu \
@@ -334,6 +337,7 @@ To update every parameter, use a smaller learning rate:
 
 ```bash
 python finetune_tabldm.py \
+  --dataset Kaballas/races \
   --checkpoint results/tabldm_horse_from_scratch.ckpt \
   --output results/tabldm_horse_scratch_full_finetuned.ckpt \
   --device cpu \
