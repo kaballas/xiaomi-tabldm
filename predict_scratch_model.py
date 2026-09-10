@@ -52,6 +52,15 @@ def parse_args():
     parser.add_argument("--context-races", type=positive_integer, default=10)
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
+        "--kv-cache",
+        choices=("kv", "repr", "off"),
+        default="kv",
+        help=(
+            "cache the fitted context between prediction races: 'kv' is fastest, "
+            "'repr' uses less memory, and 'off' disables caching (default: kv)"
+        ),
+    )
+    parser.add_argument(
         "--use-runner-mask",
         action="store_true",
         help="score only rows where runner_mask equals 1 (off by default for pre-result data)",
@@ -91,6 +100,7 @@ def build_classifier(args, context_races, feature_columns):
         ignore_index=True,
     )
     labels = np.concatenate([race.y for race in context_races])
+    kv_cache = False if args.kv_cache == "off" else args.kv_cache
     classifier = TabLDMClassifier(
         model_path=args.checkpoint,
         allow_auto_download=False,
@@ -101,8 +111,18 @@ def build_classifier(args, context_races, feature_columns):
         device=args.device,
         use_amp=False,
         use_fa3=False,
+        kv_cache=kv_cache,
     )
     classifier.fit(context, labels)
+    if kv_cache:
+        model_caches = getattr(classifier, "model_kv_cache_", None)
+        if not model_caches:
+            raise RuntimeError("KV caching was requested but no context cache was built")
+        cache_size_mb = sum(cache.cache_size_mb() for cache in model_caches.values())
+        print(
+            f"Built {args.kv_cache} context cache on {args.device} "
+            f"({cache_size_mb:,} MiB); subsequent compatible races reuse it"
+        )
     return classifier
 
 
@@ -112,7 +132,19 @@ def predict_race(classifier, race, feature_columns):
             f"Prediction race {race['race_id'].iloc[0]} has fewer than three runners"
         )
 
-    probabilities = classifier.predict_proba(race.loc[:, feature_columns])
+    features = race.loc[:, feature_columns]
+    all_missing_features = features.columns[features.isna().all()].tolist()
+    if (
+        all_missing_features
+        and getattr(classifier, "model_kv_cache_", None) is not None
+    ):
+        race_id = race["race_id"].iloc[0]
+        print(
+            f"Race {race_id}: context cache bypassed because these features are "
+            f"entirely missing: {', '.join(all_missing_features)}"
+        )
+
+    probabilities = classifier.predict_proba(features)
     positive_columns = np.flatnonzero(classifier.classes_ == 1)
     if len(positive_columns) != 1:
         raise RuntimeError(f"Expected class 1 in classifier classes, got {classifier.classes_}")

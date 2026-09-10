@@ -113,8 +113,8 @@ def parse_args():
     parser.add_argument("--moe-aux-weight", type=nonnegative_float, default=1.0)
     parser.add_argument("--patience", type=positive_integer, default=10)
 
-    # These defaults reproduce the dimensions of the standard TabLDM model,
-    # while remaining configurable for experiments and smoke tests.
+    # These defaults reproduce the released TabLDM classifier architecture
+    # (paper Tables 4-9), while remaining configurable for smoke tests.
     parser.add_argument("--embed-dim", type=positive_integer, default=128)
     parser.add_argument("--col-blocks", type=positive_integer, default=3)
     parser.add_argument("--col-heads", type=positive_integer, default=8)
@@ -122,14 +122,14 @@ def parse_args():
     parser.add_argument("--row-blocks", type=positive_integer, default=3)
     parser.add_argument("--row-heads", type=positive_integer, default=8)
     parser.add_argument("--row-cls-tokens", type=positive_integer, default=4)
-    parser.add_argument("--icl-blocks", type=positive_integer, default=12)
+    parser.add_argument("--icl-blocks", type=positive_integer, default=24)
     parser.add_argument("--icl-heads", type=positive_integer, default=8)
     parser.add_argument("--ff-factor", type=positive_integer, default=2)
     parser.add_argument("--dropout", type=probability, default=0.0)
     parser.add_argument("--feature-group-size", type=positive_integer, default=3)
     parser.add_argument("--global-max-span", type=positive_integer, default=32)
     parser.add_argument("--block-size", type=positive_integer, default=4)
-    parser.add_argument("--attnres-stride", type=positive_integer, default=2)
+    parser.add_argument("--attnres-stride", type=positive_integer, default=4)
     parser.add_argument("--moe-num-experts", type=nonnegative_integer, default=2)
     parser.add_argument("--moe-top-k", type=positive_integer, default=1)
     parser.add_argument("--moe-shared-experts", type=nonnegative_integer, default=1)
@@ -198,7 +198,9 @@ def validate_model_args(args):
 def build_model_config(args):
     """Return a loader-compatible binary classifier architecture config."""
     return {
-        "max_classes": 2,
+        # Keep the released classifier's 10-class target encoder and decoder.
+        # The horse-racing objective below trains only active classes 0 and 1.
+        "max_classes": 10,
         "embed_dim": args.embed_dim,
         "col_num_blocks": args.col_blocks,
         "col_nhead": args.col_heads,

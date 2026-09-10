@@ -289,6 +289,12 @@ The scratch trainer downloads `training.csv` and `validation.csv` from the
 Hugging Face dataset cache. `test.csv` is downloaded only when
 `--evaluate-test` is passed. To use local data instead, pass both `--train-csv`
 and `--validation-csv` (and `--test-csv` when evaluating the test split).
+Its default model arguments reproduce the released classifier architecture:
+128-dimensional column embeddings, 3 column blocks, 3 row blocks with 4 CLS
+tokens and RoPE, 24 ICL blocks with the final 8 using 2-expert top-1 MoE, and a
+10-class target encoder/decoder. The horse task loss uses active classes 0 and
+1. MoE load-balance and router z-loss terms are summed over the MoE layers and
+use the paper's default coefficients and global auxiliary weight.
 `--batch-size` stacks episodes with matching context, query, and feature
 dimensions; smaller incompatible groups are processed as partial batches.
 Episode preparation uses up to four CPU processes by default; tune this with
@@ -308,6 +314,7 @@ used for training:
 python predict_scratch_model.py \
   --checkpoint results/tabldm_horse_from_scratch.ckpt \
   --context-races 100 \
+  --kv-cache kv \
   --device cpu
 ```
 
@@ -315,6 +322,12 @@ By default it uses `data/test.csv` as labelled context, reads runners from
 `data/predict.csv`, and writes `results/tabldm_predictions.csv`. Pre-result
 rows are all scored even when `runner_mask` is zero. Pass `--use-runner-mask`
 only when the prediction file uses `runner_mask=1` to identify active runners.
+The default `--kv-cache kv` builds the context cache once during `fit` and
+reuses it for every compatible prediction race. Use `--kv-cache repr` to trade
+some speed for substantially lower cache memory, or `--kv-cache off` to disable
+it. A race with a configured feature that is entirely missing requires a
+different feature layout; the script reports that race and safely bypasses the
+cache for it.
 
 #### Fine-tuning the scratch-trained model
 
@@ -360,6 +373,7 @@ compared on validation data. To predict with the selected fine-tuned decoder:
 python predict_scratch_model.py \
   --checkpoint results/tabldm_horse_scratch_finetuned.ckpt \
   --context-races 100 \
+  --kv-cache kv \
   --device cpu
 ```
 

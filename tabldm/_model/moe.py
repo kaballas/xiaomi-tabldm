@@ -260,7 +260,9 @@ def collect_moe_aux_loss(module: nn.Module) -> Tensor:
         if first_param is None:
             return torch.zeros(())
         return first_param.new_zeros(())
-    return torch.stack(losses).mean()
+    # The TabLDM objective sums each MoE layer's already-coefficient-scaled
+    # load-balance and router z-loss before applying the global auxiliary weight.
+    return torch.stack(losses).sum()
 
 
 def collect_moe_aux_stats(module: nn.Module) -> Dict[str, float]:
