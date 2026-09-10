@@ -36,6 +36,7 @@ from typing import Optional, List, Dict, Any
 
 import numpy as np
 import torch
+from pandas.api.types import is_bool_dtype, is_numeric_dtype
 
 from sklearn.base import ClassifierMixin
 from sklearn.compose import ColumnTransformer
@@ -76,6 +77,34 @@ from tabldm._model.kv_cache import TabLDMCache
 
 _ADAPTIVE_DEFAULT_NORMS = ["none", "power"]
 _ADAPTIVE_ENS4_NORMS = ["none", "power", "quantile", "robust"]
+
+
+def _fill_all_missing_features(X, feature_mask):
+    """Make all-missing columns transformable without changing their mask.
+
+    Numeric zero cannot be assigned to pandas string extension arrays (notably
+    ``string[pyarrow]``). Use a value compatible with each column's fitted
+    preprocessing route; ``feature_mask`` still causes these columns to be
+    zeroed after numerical transformation.
+    """
+    if hasattr(X, "columns"):
+        X = X.copy()
+        for position in np.flatnonzero(feature_mask):
+            column = X.iloc[:, position]
+            if is_bool_dtype(column.dtype):
+                values = np.zeros(len(column), dtype=bool)
+            elif is_numeric_dtype(column.dtype):
+                values = np.zeros(len(column), dtype=np.float64)
+            elif hasattr(column.dtype, "categories") and len(column.dtype.categories):
+                values = np.full(len(column), column.dtype.categories[0], dtype=object)
+            else:
+                values = np.full(len(column), "__tabldm_all_missing__", dtype=object)
+            X.isetitem(position, values)
+        return X
+
+    X = np.array(X, copy=True)
+    X[:, feature_mask] = 0.0
+    return X
 
 
 def _get_adaptive_inference_config(n_features, n_num, enable_augmentations=False):
@@ -1747,10 +1776,7 @@ class TabLDMClassifier(ClassifierMixin, TabLDMBaseEstimator):
             feature_mask = None
 
         if feature_mask is not None:
-            if hasattr(X, "columns"):
-                X.iloc[:, feature_mask] = 0.0
-            else:
-                X[:, feature_mask] = 0.0
+            X = _fill_all_missing_features(X, feature_mask)
 
         X = self.X_encoder_.transform(X)
 

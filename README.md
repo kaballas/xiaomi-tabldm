@@ -275,10 +275,16 @@ to the initial rate:
 
 ```bash
 python train_tabldm_from_scratch.py \
+  --dataset Kaballas/races \
   --learning-rate 3e-4 \
   --min-learning-rate 3e-4 \
   --warmup-epochs 0
 ```
+
+The scratch trainer downloads `training.csv` and `validation.csv` from the
+Hugging Face dataset cache. `test.csv` is downloaded only when
+`--evaluate-test` is passed. To use local data instead, pass both `--train-csv`
+and `--validation-csv` (and `--test-csv` when evaluating the test split).
 
 The default output is
 `results/tabldm_horse_from_scratch.ckpt`, accompanied by a JSON metadata file.

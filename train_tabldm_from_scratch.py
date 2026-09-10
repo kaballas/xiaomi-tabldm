@@ -38,6 +38,7 @@ from finetune_tabldm import (
     train_epoch,
     validate_chronology,
 )
+from horse_racing_dataset import resolve_race_csvs
 from tabldm._model.attnres_light_rmsnorm_moe import TabLDMSparseMoE
 from tutorials.horse_racing_top3 import read_feature_columns
 
@@ -58,9 +59,34 @@ def probability(value):
 
 def parse_args():
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--train-csv", type=Path, default=ROOT / "data/train.csv")
-    parser.add_argument("--validation-csv", type=Path, default=ROOT / "data/validation.csv")
-    parser.add_argument("--test-csv", type=Path, default=ROOT / "data/test.csv")
+    parser.add_argument(
+        "--dataset",
+        default="Kaballas/races",
+        help="Hugging Face dataset repository containing training.csv, validation.csv, and test.csv",
+    )
+    parser.add_argument(
+        "--dataset-revision",
+        default=None,
+        help="optional Hugging Face branch, tag, or commit (defaults to the repository's main branch)",
+    )
+    parser.add_argument(
+        "--train-csv",
+        type=Path,
+        default=None,
+        help="local training CSV override (requires --validation-csv)",
+    )
+    parser.add_argument(
+        "--validation-csv",
+        type=Path,
+        default=None,
+        help="local validation CSV override (requires --train-csv)",
+    )
+    parser.add_argument(
+        "--test-csv",
+        type=Path,
+        default=None,
+        help="local test CSV override used with --evaluate-test",
+    )
     parser.add_argument("--features-json", type=Path, default=ROOT / "a.json")
     parser.add_argument(
         "--output",
@@ -260,13 +286,20 @@ def main():
     if args.num_threads is not None:
         torch.set_num_threads(args.num_threads)
 
-    train_header = pd.read_csv(args.train_csv, nrows=0).columns
+    train_csv, validation_csv, test_csv, data_source = resolve_race_csvs(args)
+    if data_source["type"] == "huggingface_dataset":
+        revision = args.dataset_revision or "main"
+        print(f"Dataset: https://huggingface.co/datasets/{args.dataset} (revision {revision})")
+    else:
+        print(f"Dataset: local CSV overrides ({train_csv}, {validation_csv})")
+
+    train_header = pd.read_csv(train_csv, nrows=0).columns
     feature_columns = read_feature_columns(args.features_json, train_header)
-    train_races, train_columns = load_races(args.train_csv, feature_columns)
-    validation_races, validation_columns = load_races(args.validation_csv, feature_columns)
+    train_races, train_columns = load_races(train_csv, feature_columns)
+    validation_races, validation_columns = load_races(validation_csv, feature_columns)
     test_races = None
     if args.evaluate_test:
-        test_races, test_columns = load_races(args.test_csv, feature_columns)
+        test_races, test_columns = load_races(test_csv, feature_columns)
         if list(train_columns) != list(test_columns):
             raise ValueError("Train and test CSV schemas do not match")
     if list(train_columns) != list(validation_columns):
@@ -384,6 +417,7 @@ def main():
         "created_at": datetime.now(timezone.utc).isoformat(),
         "initialization": "random",
         "source_checkpoint": None,
+        "data_source": data_source,
         "target": TARGET,
         "feature_config": str(args.features_json),
         "features": feature_columns,
