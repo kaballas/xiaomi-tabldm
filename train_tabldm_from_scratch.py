@@ -294,8 +294,6 @@ def main():
     # train_epoch shares this flag with the fine-tuning entry point. "full"
     # enables MoE auxiliary loss because every scratch parameter is trainable.
     args.finetune_mode = "full"
-    if args.num_threads is not None:
-        torch.set_num_threads(args.num_threads)
 
     train_csv, validation_csv, test_csv, data_source = resolve_race_csvs(args)
     if data_source["type"] == "huggingface_dataset":
@@ -352,6 +350,8 @@ def main():
 
     seed_everything(args.seed)
     args.resolved_device = resolve_device(args.device)
+    if args.num_threads is not None:
+        torch.set_num_threads(args.num_threads)
     model, model_config = build_model(args, args.resolved_device)
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     total_parameters = sum(parameter.numel() for parameter in model.parameters())

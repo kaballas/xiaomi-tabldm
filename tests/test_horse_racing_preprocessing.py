@@ -6,6 +6,7 @@ import warnings
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -93,3 +94,11 @@ def test_fast_preprocessing_matches_original_outlier_clipping():
         actual = preprocess_episode_features(context, query, features)
 
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_fast_preprocessing_rejects_an_all_constant_context():
+    context = pd.DataFrame({"constant": [1.0, 1.0, 1.0]})
+    query = pd.DataFrame({"constant": [2.0]})
+
+    with pytest.raises(ValueError, match="Every feature is constant"):
+        preprocess_episode_features(context, query, ["constant"])

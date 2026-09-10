@@ -282,14 +282,19 @@ def prepare_episodes(specs, feature_columns, label, workers=1):
         iterator = pool.imap(_prepare_episode_at_index, range(len(specs)), chunksize=chunk_size)
 
     episodes = []
+    completed = False
     try:
         for index, episode in enumerate(iterator, start=1):
             episodes.append(episode)
             if index % 50 == 0 or index == len(specs):
                 print(f"Prepared {label} episodes: {index}/{len(specs)}")
+        completed = True
     finally:
         if pool is not None:
-            pool.close()
+            if completed:
+                pool.close()
+            else:
+                pool.terminate()
             pool.join()
             _PREPROCESSING_SPECS = None
             _PREPROCESSING_FEATURE_COLUMNS = None
@@ -608,8 +613,6 @@ def save_finetuned_checkpoint(model, source_checkpoint, output_path, metadata):
 
 def main():
     args = parse_args()
-    if args.num_threads is not None:
-        torch.set_num_threads(args.num_threads)
     if args.learning_rate is None:
         args.learning_rate = 1e-4 if args.finetune_mode == "decoder" else 1e-5
 
@@ -665,6 +668,8 @@ def main():
 
     seed_everything(args.seed)
     args.resolved_device = resolve_device(args.device)
+    if args.num_threads is not None:
+        torch.set_num_threads(args.num_threads)
     model, source_checkpoint, source_path = load_model(args.checkpoint, args.resolved_device)
     trainable_parameters = configure_finetuning(model, args.finetune_mode)
     inference_config = build_inference_config(args.resolved_device)

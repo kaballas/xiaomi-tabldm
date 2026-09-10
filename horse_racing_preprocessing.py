@@ -55,6 +55,8 @@ def preprocess_episode_features(context_frame, query_frame, feature_columns):
         [np.unique(context[:, index]).size > 1 for index in range(context.shape[1])],
         dtype=bool,
     )
+    if not keep.any():
+        raise ValueError("Every feature is constant within the episode context")
     context = context[:, keep]
     query = query[:, keep]
 
