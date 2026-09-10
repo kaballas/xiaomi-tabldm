@@ -186,12 +186,17 @@ clf = TabLDMClassifier.load("classifier.pkl")
 When `save_model_weights=False` (the default), the saved file is smaller, but the
 weights must be reloaded from `model_path` or the Hub when loading the estimator.
 
-### Experimental Horse-Racing Fine-Tuning
+### Experimental Horse-Racing Training
 
-The repository-level `finetune_tabldm.py` script provides downstream weight
-training for the supplied chronological horse-racing CSV splits. It constructs
-each episode from complete earlier context races and one later query race, and
-uses only the fields listed in `a.json`.
+The repository-level training scripts construct each episode from complete
+earlier context races and one later query race. They use only the fields listed
+in `a.json`; `race_id` controls chronological grouping and is not a model
+feature.
+
+#### Fine-tuning a pretrained checkpoint
+
+`finetune_tabldm.py` provides downstream weight training for the supplied
+chronological horse-racing CSV splits.
 
 ```bash
 # Fastest/safest first experiment: train only the prediction decoder.
@@ -207,14 +212,19 @@ python finetune_tabldm.py \
   --epochs 1 \
   --max-train-races 1 \
   --max-validation-races 1 \
-  --max-test-races 1 \
   --no-save
 ```
 
 The available stages are `decoder`, `icl`, `row_icl`, and `full`. Complete
 fine-tuned checkpoints remain compatible with `TabLDMClassifier(model_path=...)`.
 Use the same feature JSON at inference time; `tutorials/horse_racing_top3.py`
-checks the adjacent checkpoint metadata when available.
+checks the adjacent checkpoint metadata when available. Development runs do not
+read the sealed test CSV. Add `--evaluate-test` only to the final selected run.
+
+Checkpoint selection prioritizes validation Top-3 recall, then exact 3/3 race
+rate, with race log loss as the tie-breaker. A controlled listwise-loss sweep
+can be run by repeating the decoder experiment with `--listwise-weight` set to
+`0`, `0.1`, `0.25`, and `0.5`.
 
 ```bash
 python tutorials/horse_racing_top3.py \
@@ -222,6 +232,119 @@ python tutorials/horse_racing_top3.py \
   --features-json a.json \
   --context-races 10 \
   --n-estimators 1
+```
+
+#### Training a horse-racing model from scratch
+
+`train_tabldm_from_scratch.py` constructs a new binary TabLDM classifier with
+randomly initialized weights and trains every parameter. It does not read a
+pretrained checkpoint. The resulting model is specific to this horse-racing
+task; it does not reproduce Xiaomi's general foundation-model pretraining,
+whose synthetic-data pipeline is not included in this inference-oriented
+repository.
+
+For example, the following command trains the smaller model architecture with
+100 complete context races and up to 5,000 training episodes:
+
+```bash
+python train_tabldm_from_scratch.py \
+  --device cpu \
+  --epochs 5 \
+  --warmup-epochs 0 \
+  --context-races 100 \
+  --max-train-races 5000 \
+  --max-validation-races 2000 \
+  --embed-dim 16 \
+  --col-blocks 1 \
+  --col-heads 2 \
+  --col-inducing-points 8 \
+  --row-blocks 1 \
+  --row-heads 2 \
+  --row-cls-tokens 2 \
+  --icl-blocks 2 \
+  --icl-heads 2 \
+  --moe-layers all
+```
+
+The scratch trainer uses linear warmup followed by cosine learning-rate decay.
+`--warmup-epochs 0` disables only warmup, not decay. With the defaults
+`--learning-rate 3e-4`, `--min-learning-rate 3e-5`, and `--epochs 5`, the
+epoch learning rates are approximately `3e-4`, `2.6e-4`, `1.65e-4`,
+`6.95e-5`, and `3e-5`. To use a constant learning rate, set the minimum equal
+to the initial rate:
+
+```bash
+python train_tabldm_from_scratch.py \
+  --learning-rate 3e-4 \
+  --min-learning-rate 3e-4 \
+  --warmup-epochs 0
+```
+
+The default output is
+`results/tabldm_horse_from_scratch.ckpt`, accompanied by a JSON metadata file.
+
+#### Predicting with the scratch-trained model
+
+`predict_scratch_model.py` loads the scratch checkpoint, fits the labelled
+in-context races, scores each prediction race independently, and selects the
+three runners with the highest class-1 probabilities. Use the same context size
+used for training:
+
+```bash
+python predict_scratch_model.py \
+  --checkpoint results/tabldm_horse_from_scratch.ckpt \
+  --context-races 100 \
+  --device cpu
+```
+
+By default it uses `data/test.csv` as labelled context, reads runners from
+`data/predict.csv`, and writes `results/tabldm_predictions.csv`. Pre-result
+rows are all scored even when `runner_mask` is zero. Pass `--use-runner-mask`
+only when the prediction file uses `runner_mask=1` to identify active runners.
+
+#### Fine-tuning the scratch-trained model
+
+The saved scratch checkpoint is compatible with `finetune_tabldm.py`. A safe
+first experiment updates only its decoder while preserving the representations
+learned during scratch training:
+
+```bash
+python finetune_tabldm.py \
+  --checkpoint results/tabldm_horse_from_scratch.ckpt \
+  --output results/tabldm_horse_scratch_finetuned.ckpt \
+  --device cpu \
+  --finetune-mode decoder \
+  --context-races 100 \
+  --epochs 20 \
+  --learning-rate 1e-4 \
+  --listwise-weight 0.1 \
+  --gradient-accumulation 4
+```
+
+To update every parameter, use a smaller learning rate:
+
+```bash
+python finetune_tabldm.py \
+  --checkpoint results/tabldm_horse_from_scratch.ckpt \
+  --output results/tabldm_horse_scratch_full_finetuned.ckpt \
+  --device cpu \
+  --finetune-mode full \
+  --context-races 100 \
+  --epochs 10 \
+  --learning-rate 1e-5 \
+  --listwise-weight 0.1 \
+  --gradient-accumulation 4
+```
+
+Unlike the scratch trainer, `finetune_tabldm.py` uses a constant learning rate.
+Keep the original scratch checkpoint until the fine-tuned checkpoint has been
+compared on validation data. To predict with the selected fine-tuned decoder:
+
+```bash
+python predict_scratch_model.py \
+  --checkpoint results/tabldm_horse_scratch_finetuned.ckpt \
+  --context-races 100 \
+  --device cpu
 ```
 
 ## Advanced Configuration

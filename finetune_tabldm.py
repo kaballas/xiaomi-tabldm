@@ -90,13 +90,17 @@ def parse_args():
     parser.add_argument("--listwise-weight", type=nonnegative_float, default=0.0)
     parser.add_argument("--moe-aux-weight", type=nonnegative_float, default=1.0)
     parser.add_argument("--patience", type=positive_integer, default=4)
-    parser.add_argument("--min-delta", type=nonnegative_float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num-threads", type=positive_integer, default=None)
     parser.add_argument("--max-train-races", type=positive_integer, default=None)
     parser.add_argument("--max-validation-races", type=positive_integer, default=None)
     parser.add_argument("--max-test-races", type=positive_integer, default=None)
+    parser.add_argument(
+        "--evaluate-test",
+        action="store_true",
+        help="evaluate the sealed test split after selecting the best checkpoint",
+    )
     parser.add_argument("--no-runner-shuffle", action="store_true")
     parser.add_argument("--no-save", action="store_true")
     return parser.parse_args()
@@ -144,10 +148,10 @@ def load_races(csv_path, feature_columns):
     return races, frame.columns
 
 
-def validate_chronology(train_races, validation_races, test_races):
+def validate_chronology(train_races, validation_races, test_races=None):
     if train_races[-1].start_time >= validation_races[0].start_time:
         raise ValueError("Training races are not strictly earlier than validation races")
-    if validation_races[-1].start_time >= test_races[0].start_time:
+    if test_races is not None and validation_races[-1].start_time >= test_races[0].start_time:
         raise ValueError("Validation races are not strictly earlier than test races")
 
 
@@ -371,6 +375,7 @@ def evaluate(model, episodes, device, inference_config):
     winner_in_top3 = []
     top3_recalls = []
     exact_top3 = []
+    hit_counts = []
 
     for episode in episodes:
         X, y_context, y_query = episode_tensors(episode, device)
@@ -388,10 +393,12 @@ def evaluate(model, episodes, device, inference_config):
         winner_index = int(np.flatnonzero(episode.winner_query == 1)[0])
         top1_winner.append(float(ranked[0] == winner_index))
         winner_in_top3.append(float(winner_index in selected))
-        top3_recalls.append(len(selected.intersection(actual_top3)) / 3)
+        hits = len(selected.intersection(actual_top3))
+        hit_counts.append(hits)
+        top3_recalls.append(hits / 3)
         exact_top3.append(float(selected == actual_top3))
 
-    return {
+    metrics = {
         "race_log_loss": float(np.mean(log_losses)),
         "top1_winner_accuracy": float(np.mean(top1_winner)),
         "winner_in_top3": float(np.mean(winner_in_top3)),
@@ -399,6 +406,9 @@ def evaluate(model, episodes, device, inference_config):
         "exact_top3_rate": float(np.mean(exact_top3)),
         "races": len(episodes),
     }
+    for hits in range(4):
+        metrics[f"hit_rate_{hits}_of_3"] = float(np.mean(np.asarray(hit_counts) == hits))
+    return metrics
 
 
 def format_metrics(metrics):
@@ -408,7 +418,20 @@ def format_metrics(metrics):
         f"winner@3={metrics['winner_in_top3']:.3f} "
         f"top3_recall={metrics['top3_recall']:.3f} "
         f"exact_top3={metrics['exact_top3_rate']:.3f} "
+        f"hits[3/2/1/0]={metrics['hit_rate_3_of_3']:.3f}/"
+        f"{metrics['hit_rate_2_of_3']:.3f}/"
+        f"{metrics['hit_rate_1_of_3']:.3f}/"
+        f"{metrics['hit_rate_0_of_3']:.3f} "
         f"races={metrics['races']}"
+    )
+
+
+def checkpoint_score(metrics):
+    """Rank checkpoints by Top-3 selection quality, then probability quality."""
+    return (
+        metrics["top3_recall"],
+        metrics["exact_top3_rate"],
+        -metrics["race_log_loss"],
     )
 
 
@@ -455,29 +478,37 @@ def main():
     feature_columns = read_feature_columns(args.features_json, train_header)
     train_races, train_columns = load_races(args.train_csv, feature_columns)
     validation_races, validation_columns = load_races(args.validation_csv, feature_columns)
-    test_races, test_columns = load_races(args.test_csv, feature_columns)
-    if list(train_columns) != list(validation_columns) or list(train_columns) != list(test_columns):
-        raise ValueError("Train, validation and test CSV schemas do not match")
+    test_races = None
+    if args.evaluate_test:
+        test_races, test_columns = load_races(args.test_csv, feature_columns)
+        if list(train_columns) != list(test_columns):
+            raise ValueError("Train and test CSV schemas do not match")
+    if list(train_columns) != list(validation_columns):
+        raise ValueError("Train and validation CSV schemas do not match")
     validate_chronology(train_races, validation_races, test_races)
 
     train_specs = episode_specs(train_races, [], args.context_races, args.max_train_races)
     validation_specs = episode_specs(
         validation_races, train_races, args.context_races, args.max_validation_races
     )
-    test_specs = episode_specs(
-        test_races, train_races + validation_races, args.context_races, args.max_test_races
-    )
-    if not train_specs or not validation_specs or not test_specs:
-        raise ValueError("Each split must produce at least one race episode")
+    test_specs = None
+    if test_races is not None:
+        test_specs = episode_specs(
+            test_races, train_races + validation_races, args.context_races, args.max_test_races
+        )
+    if not train_specs or not validation_specs or (test_specs is not None and not test_specs):
+        raise ValueError("Every requested split must produce at least one race episode")
 
-    print(
-        f"Chronological races: train={len(train_races)}, validation={len(validation_races)}, "
-        f"test={len(test_races)}; context={args.context_races} race(s)"
-    )
+    split_summary = f"train={len(train_races)}, validation={len(validation_races)}"
+    if test_races is not None:
+        split_summary += f", test={len(test_races)}"
+    print(f"Chronological races: {split_summary}; context={args.context_races} race(s)")
     print(f"Configured features: {len(feature_columns)} from {args.features_json}")
     train_episodes = prepare_episodes(train_specs, feature_columns, "training")
     validation_episodes = prepare_episodes(validation_specs, feature_columns, "validation")
-    test_episodes = prepare_episodes(test_specs, feature_columns, "test")
+    test_episodes = (
+        prepare_episodes(test_specs, feature_columns, "test") if test_specs is not None else None
+    )
 
     model, source_checkpoint, source_path = load_model(args.checkpoint, args.resolved_device)
     trainable_parameters = configure_finetuning(model, args.finetune_mode)
@@ -493,10 +524,8 @@ def main():
     optimizer = torch.optim.AdamW(trainable_parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
     history = []
     baseline_validation = evaluate(model, validation_episodes, args.resolved_device, inference_config)
-    baseline_test = evaluate(model, test_episodes, args.resolved_device, inference_config)
     print(f"Pretrained validation: {format_metrics(baseline_validation)}")
-    print(f"Pretrained test:       {format_metrics(baseline_test)}")
-    best_loss = baseline_validation["race_log_loss"]
+    best_score = checkpoint_score(baseline_validation)
     best_epoch = 0
     stale_epochs = 0
 
@@ -516,8 +545,9 @@ def main():
                 f"val {format_metrics(validation_metrics)}"
             )
 
-            if validation_metrics["race_log_loss"] < best_loss - args.min_delta:
-                best_loss = validation_metrics["race_log_loss"]
+            score = checkpoint_score(validation_metrics)
+            if score > best_score:
+                best_score = score
                 best_epoch = epoch
                 stale_epochs = 0
                 save_trainable_parameters(model, best_parameters_path)
@@ -530,10 +560,14 @@ def main():
         restore_trainable_parameters(model, best_parameters_path)
 
     final_validation = evaluate(model, validation_episodes, args.resolved_device, inference_config)
-    final_test = evaluate(model, test_episodes, args.resolved_device, inference_config)
     print(f"Selected checkpoint epoch: {best_epoch} (0 means untouched pretrained weights)")
     print(f"Best validation: {format_metrics(final_validation)}")
-    print(f"Sealed test:     {format_metrics(final_test)}")
+    final_test = None
+    if test_episodes is not None:
+        final_test = evaluate(model, test_episodes, args.resolved_device, inference_config)
+        print(f"Sealed test:     {format_metrics(final_test)}")
+    else:
+        print("Sealed test not accessed; pass --evaluate-test only for final evaluation")
 
     metadata = {
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -551,9 +585,10 @@ def main():
         "seed": args.seed,
         "epochs_completed": len(history),
         "best_epoch": best_epoch,
+        "checkpoint_selection": ["top3_recall", "exact_top3_rate", "negative_race_log_loss"],
+        "best_score": list(best_score),
         "history": history,
         "pretrained_validation": baseline_validation,
-        "pretrained_test": baseline_test,
         "validation": final_validation,
         "test": final_test,
     }

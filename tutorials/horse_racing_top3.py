@@ -5,7 +5,7 @@ The ID itself is excluded from the predictors because it is an arbitrary key.
 
 Examples
 --------
-Use the first 10 eligible races starting at the requested context race::
+Use the 10 most recent eligible races before the prediction race::
 
     python tutorials/horse_racing_top3.py --context-races 10
 
@@ -88,8 +88,11 @@ def parse_args():
     )
     parser.add_argument(
         "--context-race-id",
-        default="10868873",
-        help="first context race; later eligible races are selected in CSV order",
+        default=None,
+        help=(
+            "optional first context race; eligible races from this race forward are used. "
+            "By default, use the most recent eligible races before the prediction race"
+        ),
     )
     parser.add_argument("--prediction-race-id", default="10891607")
     parser.add_argument("--device", default="cpu")
@@ -171,32 +174,58 @@ def has_complete_top3_labels(race):
     return labels == {0, 1} and int(race[TARGET].sum()) == 3
 
 
-def select_context_races(frame, first_race_id, number_of_races):
-    race_ids = frame["race_id"].drop_duplicates().tolist()
-    race_id_strings = [str(race_id) for race_id in race_ids]
-    try:
-        start = race_id_strings.index(str(first_race_id))
-    except ValueError as error:
-        raise ValueError(f"Context race {first_race_id} is absent from the context CSV") from error
+def select_context_races(frame, first_race_id, number_of_races, prediction_time):
+    if "start_time_iso" not in frame.columns:
+        raise ValueError("The context CSV needs start_time_iso for chronological race selection")
 
-    selected_frames = []
-    selected_ids = []
+    race_index = frame.loc[:, ["race_id", "start_time_iso"]].drop_duplicates("race_id").copy()
+    race_index["race_time"] = pd.to_datetime(race_index["start_time_iso"], utc=True, errors="coerce")
+    if race_index["race_time"].isna().any():
+        bad_ids = race_index.loc[race_index["race_time"].isna(), "race_id"].head(10).tolist()
+        raise ValueError(f"Invalid start_time_iso for context races: {bad_ids}")
+
+    # A context label must have been available before the race being predicted.
+    race_index = race_index.loc[race_index["race_time"] < prediction_time]
+    race_index = race_index.sort_values(["race_time", "race_id"], kind="stable")
+    race_ids = race_index["race_id"].tolist()
+
+    start = 0
+    if first_race_id is not None:
+        race_id_strings = [str(race_id) for race_id in race_ids]
+        try:
+            start = race_id_strings.index(str(first_race_id))
+        except ValueError as error:
+            raise ValueError(
+                f"Explicit context race {first_race_id} is absent or is not before the "
+                "prediction race"
+            ) from error
+
+    eligible = []
     inactive_count = 0
     for race_id in race_ids[start:]:
         race, inactive = active_race(frame, race_id)
         if not has_complete_top3_labels(race):
             continue
-        selected_frames.append(race)
-        selected_ids.append(race_id)
-        inactive_count += inactive
-        if len(selected_frames) == number_of_races:
-            break
+        eligible.append((race_id, race, inactive))
 
-    if len(selected_frames) < number_of_races:
-        raise ValueError(
-            f"Only {len(selected_frames)} eligible labelled races are available at or after "
-            f"race {first_race_id}; requested {number_of_races}"
+    if first_race_id is None:
+        eligible = eligible[-number_of_races:]
+    else:
+        eligible = eligible[:number_of_races]
+
+    if len(eligible) < number_of_races:
+        selection_description = (
+            "before the prediction race"
+            if first_race_id is None
+            else f"at or after race {first_race_id} and before the prediction race"
         )
+        raise ValueError(
+            f"Only {len(eligible)} eligible labelled races are available "
+            f"{selection_description}; requested {number_of_races}"
+        )
+    selected_ids = [race_id for race_id, _, _ in eligible]
+    selected_frames = [race for _, race, _ in eligible]
+    inactive_count = sum(inactive for _, _, inactive in eligible)
     return selected_frames, selected_ids, inactive_count
 
 
@@ -226,7 +255,7 @@ def text_overlap_stats(context, prediction, show_details=False):
 
     varying_count = sum(item["varies_in_context"] for item in details)
     known_rate = matched / max(observed, 1)
-    if show_details:
+    if show_details and details:
         detail_frame = pd.DataFrame(details).set_index("field")
         fields_to_show = [
             field
@@ -318,9 +347,13 @@ def main():
         raise ValueError("The prediction race must have at least three active runners")
     if not has_complete_top3_labels(prediction):
         raise ValueError("This comparison example needs a prediction race with three known top-three labels")
+    prediction_times = pd.to_datetime(prediction["start_time_iso"], utc=True, errors="coerce")
+    if prediction_times.isna().any() or prediction_times.nunique() != 1:
+        raise ValueError("The prediction race must have one valid start_time_iso value")
+    prediction_time = prediction_times.iloc[0]
 
     context_frames, context_ids, _ = select_context_races(
-        context_source, args.context_race_id, max(context_counts)
+        context_source, args.context_race_id, max(context_counts), prediction_time
     )
     if args.context_csv.resolve() == args.prediction_csv.resolve():
         prediction_id = str(args.prediction_race_id)
@@ -331,7 +364,10 @@ def main():
         f"Prediction: {args.prediction_csv.name} race_id={args.prediction_race_id}, "
         f"{len(prediction)} active runners ({prediction_inactive} inactive omitted)"
     )
-    print(f"Context starts at {args.context_race_id}; comparing race counts: {context_counts}")
+    if args.context_race_id is None:
+        print(f"Context: most recent eligible races before prediction; comparing: {context_counts}")
+    else:
+        print(f"Context starts at {args.context_race_id}; comparing race counts: {context_counts}")
     print("race_id defines whole-race boundaries and is excluded from model features.")
     print(f"Configured features: {len(configured_features)} from {args.features_json}")
 

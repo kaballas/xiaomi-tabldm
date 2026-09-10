@@ -2,3 +2,9 @@
 __pycache__/
 *.pyc
 results/
+
+# Local datasets
+data/train.csv
+data/validation.csv
+data/test.csv
+data/predict.csv
