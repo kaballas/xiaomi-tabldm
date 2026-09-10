@@ -23,8 +23,8 @@ import torch
 import torch.nn.functional as F
 
 from horse_racing_dataset import resolve_race_csvs
+from horse_racing_preprocessing import preprocess_episode_features
 from tabldm import InferenceConfig, TabLDMClassifier
-from tabldm._sklearn.preprocessing import EnsembleGenerator, TransformToNumerical
 from tutorials.horse_racing_top3 import read_feature_columns
 
 
@@ -150,11 +150,12 @@ def resolve_device(requested):
 
 
 def load_races(csv_path, feature_columns):
-    frame = pd.read_csv(csv_path, low_memory=False)
     required = {"race_id", "start_time_iso", "runner_mask", TARGET, "is_winner", *feature_columns}
-    missing = sorted(required.difference(frame.columns))
+    columns = pd.read_csv(csv_path, nrows=0).columns
+    missing = sorted(required.difference(columns))
     if missing:
         raise ValueError(f"{csv_path} is missing required columns: {missing}")
+    frame = pd.read_csv(csv_path, low_memory=False, usecols=required)
 
     races = []
     for race_id, group in frame.groupby("race_id", sort=False):
@@ -166,12 +167,20 @@ def load_races(csv_path, feature_columns):
         if set(np.unique(labels)) != {0, 1} or int(labels.sum()) != 3 or int(winner.sum()) != 1:
             continue
         start_time = pd.to_datetime(active["start_time_iso"].iloc[0], utc=True, errors="raise")
-        races.append(Race(str(race_id), start_time, active, labels, winner))
+        races.append(
+            Race(
+                str(race_id),
+                start_time,
+                active.loc[:, feature_columns].copy(),
+                labels,
+                winner,
+            )
+        )
 
     races.sort(key=lambda race: (race.start_time, race.race_id))
     if not races:
         raise ValueError(f"No eligible labelled races found in {csv_path}")
-    return races, frame.columns
+    return races, columns
 
 
 def validate_chronology(train_races, validation_races, test_races=None):
@@ -208,28 +217,17 @@ def prepare_episode(context_races, query_race, feature_columns):
     context_y = np.concatenate([race.y for race in context_races])
     context_sizes = tuple(len(race.frame) for race in context_races)
 
-    # Match the public classifier: fit string encoding, constant filtering and
-    # scaling on labelled context only, then apply them to the later query.
-    encoder = TransformToNumerical()
+    # Fit encoding, constant filtering, scaling, and outlier handling on the
+    # labelled context only, then apply the same transformations to the query.
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="The following categorical columns have a cardinality above 40")
         warnings.filterwarnings("ignore", message="Skipping features without any observed values")
-        X_context = encoder.fit_transform(context_frame.loc[:, feature_columns])
-        X_query = encoder.transform(query_race.frame.loc[:, feature_columns])
-
-    generator = EnsembleGenerator(
-        classification=True,
-        n_estimators=1,
-        norm_methods="none",
-        feat_shuffle_method="none",
-        class_shuffle_method="none",
-        random_state=0,
-    )
-    generator.fit(X_context, context_y)
-    generated = generator.transform(X_query, mode="both")
-    X_all, y_ensemble = next(iter(generated.values()))
-    X_all = np.asarray(X_all[0], dtype=np.float32)
-    y_context = np.asarray(y_ensemble[0], dtype=np.int64)
+        X_all = preprocess_episode_features(
+            context_frame,
+            query_race.frame,
+            feature_columns,
+        )
+    y_context = np.asarray(context_y, dtype=np.int64)
 
     if not np.isfinite(X_all).all():
         raise ValueError(f"Preprocessing produced non-finite values for query race {query_race.race_id}")
