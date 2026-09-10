@@ -280,10 +280,60 @@ def shuffled_episode_arrays(episode, rng, shuffle_runners):
 
 
 def episode_tensors(episode, device, rng=None, shuffle_runners=False):
-    X_context, y_context, X_query, y_query = shuffled_episode_arrays(episode, rng, shuffle_runners)
-    X = torch.from_numpy(np.concatenate([X_context, X_query], axis=0)).unsqueeze(0).to(device)
-    y_context_tensor = torch.from_numpy(y_context).unsqueeze(0).to(device=device, dtype=torch.float32)
-    y_query_tensor = torch.from_numpy(y_query).unsqueeze(0).to(device=device, dtype=torch.long)
+    return episode_batch_tensors([episode], device, rng, shuffle_runners)
+
+
+def episode_batch_key(episode):
+    """Return dimensions that must match before episodes can be stacked."""
+    if episode.X_context.ndim != 2 or episode.X_query.ndim != 2:
+        raise ValueError("Episode feature arrays must be two-dimensional")
+    if episode.X_context.shape[1] != episode.X_query.shape[1]:
+        raise ValueError(f"Episode {episode.race_id} has mismatched context/query features")
+    return (
+        len(episode.X_context),
+        len(episode.X_query),
+        episode.X_context.shape[1],
+    )
+
+
+def episode_batches(episodes, batch_size, order=None):
+    """Group episode indices into shape-compatible minibatches."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    if order is None:
+        order = range(len(episodes))
+
+    buckets = {}
+    for episode_index in order:
+        key = episode_batch_key(episodes[episode_index])
+        buckets.setdefault(key, []).append(int(episode_index))
+
+    batches = []
+    for indices in buckets.values():
+        batches.extend(
+            indices[start : start + batch_size]
+            for start in range(0, len(indices), batch_size)
+        )
+    return batches
+
+
+def episode_batch_tensors(episodes, device, rng=None, shuffle_runners=False):
+    """Stack a shape-compatible group of episodes and move it to a device."""
+    arrays = [
+        shuffled_episode_arrays(episode, rng, shuffle_runners)
+        for episode in episodes
+    ]
+    X = torch.from_numpy(
+        np.stack(
+            [np.concatenate([X_context, X_query], axis=0) for X_context, _, X_query, _ in arrays]
+        )
+    ).to(device)
+    y_context_tensor = torch.from_numpy(
+        np.stack([y_context for _, y_context, _, _ in arrays])
+    ).to(device=device, dtype=torch.float32)
+    y_query_tensor = torch.from_numpy(
+        np.stack([y_query for _, _, _, y_query in arrays])
+    ).to(device=device, dtype=torch.long)
     return X, y_context_tensor, y_query_tensor
 
 
@@ -314,16 +364,25 @@ def train_epoch(model, episodes, optimizer, trainable_parameters, args, epoch):
     optimizer.zero_grad(set_to_none=True)
     rng = np.random.default_rng(args.seed + epoch)
     order = rng.permutation(len(episodes))
+    batches = episode_batches(episodes, getattr(args, "batch_size", 1), order)
+    batches = [batches[index] for index in rng.permutation(len(batches))]
+    if epoch == 1:
+        mean_batch_size = len(episodes) / len(batches)
+        print(
+            f"Shape-compatible training batches: {len(episodes)} episodes -> "
+            f"{len(batches)} batches (mean={mean_batch_size:.2f}, "
+            f"maximum={getattr(args, 'batch_size', 1)})"
+        )
     objective_losses = []
     cross_entropy_losses = []
     listwise_losses = []
     auxiliary_losses = []
     accumulated = 0
 
-    for position, episode_index in enumerate(order, start=1):
-        episode = episodes[episode_index]
-        X, y_context, y_query = episode_tensors(
-            episode,
+    for position, batch_indices in enumerate(batches, start=1):
+        batch_episodes = [episodes[index] for index in batch_indices]
+        X, y_context, y_query = episode_batch_tensors(
+            batch_episodes,
             args.resolved_device,
             rng=rng,
             shuffle_runners=not args.no_runner_shuffle,
@@ -335,22 +394,26 @@ def train_epoch(model, episodes, optimizer, trainable_parameters, args, epoch):
             auxiliary = model.moe_aux_loss()
             loss = loss + args.moe_aux_weight * auxiliary
         if not torch.isfinite(loss):
-            raise RuntimeError(f"Non-finite training loss for query race {episode.race_id}")
-        loss.backward()
-        objective_losses.append(float(loss.detach()))
-        cross_entropy_losses.append(float(cross_entropy.detach()))
-        listwise_losses.append(float(listwise.detach()))
-        auxiliary_losses.append(float(auxiliary.detach()))
-        accumulated += 1
+            race_ids = ", ".join(episode.race_id for episode in batch_episodes)
+            raise RuntimeError(f"Non-finite training loss for query race batch: {race_ids}")
 
-        if accumulated == args.gradient_accumulation or position == len(order):
+        episodes_in_batch = len(batch_episodes)
+        (loss * episodes_in_batch).backward()
+        objective_losses.append(loss.detach() * episodes_in_batch)
+        cross_entropy_losses.append(cross_entropy.detach() * episodes_in_batch)
+        listwise_losses.append(listwise.detach() * episodes_in_batch)
+        auxiliary_losses.append(auxiliary.detach() * episodes_in_batch)
+        accumulated += episodes_in_batch
+
+        if accumulated >= args.gradient_accumulation or position == len(batches):
             optimizer_step(optimizer, trainable_parameters, accumulated, args.grad_clip)
             accumulated = 0
+    episode_count = len(episodes)
     return {
-        "objective": float(np.mean(objective_losses)),
-        "cross_entropy": float(np.mean(cross_entropy_losses)),
-        "listwise": float(np.mean(listwise_losses)),
-        "moe_aux": float(np.mean(auxiliary_losses)),
+        "objective": float(torch.stack(objective_losses).sum().cpu() / episode_count),
+        "cross_entropy": float(torch.stack(cross_entropy_losses).sum().cpu() / episode_count),
+        "listwise": float(torch.stack(listwise_losses).sum().cpu() / episode_count),
+        "moe_aux": float(torch.stack(auxiliary_losses).sum().cpu() / episode_count),
     }
 
 
@@ -368,7 +431,7 @@ def build_inference_config(device):
 
 
 @torch.no_grad()
-def evaluate(model, episodes, device, inference_config):
+def evaluate(model, episodes, device, inference_config, batch_size=1):
     model.eval()
     log_losses = []
     top1_winner = []
@@ -377,26 +440,31 @@ def evaluate(model, episodes, device, inference_config):
     exact_top3 = []
     hit_counts = []
 
-    for episode in episodes:
-        X, y_context, y_query = episode_tensors(episode, device)
+    for batch_indices in episode_batches(episodes, batch_size):
+        batch_episodes = [episodes[index] for index in batch_indices]
+        X, y_context, y_query = episode_batch_tensors(batch_episodes, device)
         logits = model(
             X,
             y_train=y_context,
             embed_with_test=False,
             inference_config=inference_config,
         )[..., :2]
-        log_losses.append(float(F.cross_entropy(logits.reshape(-1, 2), y_query.reshape(-1))))
-        scores = (logits[0, :, 1] - logits[0, :, 0]).cpu().numpy()
-        ranked = np.argsort(-scores, kind="stable")
-        selected = set(ranked[:3].tolist())
-        actual_top3 = set(np.flatnonzero(episode.y_query == 1).tolist())
-        winner_index = int(np.flatnonzero(episode.winner_query == 1)[0])
-        top1_winner.append(float(ranked[0] == winner_index))
-        winner_in_top3.append(float(winner_index in selected))
-        hits = len(selected.intersection(actual_top3))
-        hit_counts.append(hits)
-        top3_recalls.append(hits / 3)
-        exact_top3.append(float(selected == actual_top3))
+        per_row_losses = F.cross_entropy(
+            logits.reshape(-1, 2), y_query.reshape(-1), reduction="none"
+        ).view(len(batch_episodes), -1)
+        log_losses.extend(per_row_losses.mean(dim=1).cpu().tolist())
+        batch_scores = (logits[..., 1] - logits[..., 0]).cpu().numpy()
+        for episode, scores in zip(batch_episodes, batch_scores):
+            ranked = np.argsort(-scores, kind="stable")
+            selected = set(ranked[:3].tolist())
+            actual_top3 = set(np.flatnonzero(episode.y_query == 1).tolist())
+            winner_index = int(np.flatnonzero(episode.winner_query == 1)[0])
+            top1_winner.append(float(ranked[0] == winner_index))
+            winner_in_top3.append(float(winner_index in selected))
+            hits = len(selected.intersection(actual_top3))
+            hit_counts.append(hits)
+            top3_recalls.append(hits / 3)
+            exact_top3.append(float(selected == actual_top3))
 
     metrics = {
         "race_log_loss": float(np.mean(log_losses)),

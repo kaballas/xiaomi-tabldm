@@ -100,6 +100,12 @@ def parse_args():
     parser.add_argument("--min-learning-rate", type=nonnegative_float, default=3e-5)
     parser.add_argument("--warmup-epochs", type=nonnegative_integer, default=5)
     parser.add_argument("--weight-decay", type=nonnegative_float, default=1e-4)
+    parser.add_argument(
+        "--batch-size",
+        type=positive_integer,
+        default=8,
+        help="maximum number of shape-compatible race episodes per GPU batch",
+    )
     parser.add_argument("--gradient-accumulation", type=positive_integer, default=4)
     parser.add_argument("--grad-clip", type=nonnegative_float, default=1.0)
     parser.add_argument("--listwise-weight", type=nonnegative_float, default=0.0)
@@ -353,7 +359,11 @@ def main():
     )
     inference_config = build_inference_config(args.resolved_device)
     initial_validation = evaluate(
-        model, validation_episodes, args.resolved_device, inference_config
+        model,
+        validation_episodes,
+        args.resolved_device,
+        inference_config,
+        batch_size=args.batch_size,
     )
     print(f"Random-init validation: {format_metrics(initial_validation)}")
 
@@ -369,7 +379,11 @@ def main():
                 model, train_episodes, optimizer, trainable_parameters, args, epoch
             )
             validation_metrics = evaluate(
-                model, validation_episodes, args.resolved_device, inference_config
+                model,
+                validation_episodes,
+                args.resolved_device,
+                inference_config,
+                batch_size=args.batch_size,
             )
             history.append(
                 {
@@ -403,12 +417,24 @@ def main():
 
         restore_trainable_parameters(model, best_parameters_path)
 
-    final_validation = evaluate(model, validation_episodes, args.resolved_device, inference_config)
+    final_validation = evaluate(
+        model,
+        validation_episodes,
+        args.resolved_device,
+        inference_config,
+        batch_size=args.batch_size,
+    )
     print(f"Selected checkpoint epoch: {best_epoch}")
     print(f"Best validation: {format_metrics(final_validation)}")
     final_test = None
     if test_episodes is not None:
-        final_test = evaluate(model, test_episodes, args.resolved_device, inference_config)
+        final_test = evaluate(
+            model,
+            test_episodes,
+            args.resolved_device,
+            inference_config,
+            batch_size=args.batch_size,
+        )
         print(f"Sealed test:     {format_metrics(final_test)}")
     else:
         print("Sealed test not accessed; pass --evaluate-test only for final evaluation")
@@ -424,6 +450,7 @@ def main():
         "preprocessing": "per-episode context-fitted, normalization=none, no feature/class shuffle",
         "model_config": model_config,
         "context_races": args.context_races,
+        "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
         "min_learning_rate": args.min_learning_rate,
         "warmup_epochs": args.warmup_epochs,
