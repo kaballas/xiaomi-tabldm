@@ -364,14 +364,19 @@ def train_epoch(model, episodes, optimizer, trainable_parameters, args, epoch):
     optimizer.zero_grad(set_to_none=True)
     rng = np.random.default_rng(args.seed + epoch)
     order = rng.permutation(len(episodes))
-    batches = episode_batches(episodes, getattr(args, "batch_size", 1), order)
-    batches = [batches[index] for index in rng.permutation(len(batches))]
+    batch_size = getattr(args, "batch_size", 1)
+    if batch_size == 1:
+        # Preserve the original seeded episode and runner-shuffle order.
+        batches = [[int(index)] for index in order]
+    else:
+        batches = episode_batches(episodes, batch_size, order)
+        batches = [batches[index] for index in rng.permutation(len(batches))]
     if epoch == 1:
         mean_batch_size = len(episodes) / len(batches)
         print(
             f"Shape-compatible training batches: {len(episodes)} episodes -> "
             f"{len(batches)} batches (mean={mean_batch_size:.2f}, "
-            f"maximum={getattr(args, 'batch_size', 1)})"
+            f"maximum={batch_size})"
         )
     objective_losses = []
     cross_entropy_losses = []
