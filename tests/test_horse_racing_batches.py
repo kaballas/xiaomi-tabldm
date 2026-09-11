@@ -16,7 +16,9 @@ from finetune_tabldm import (  # noqa: E402
     episode_batch_tensors,
     episode_batches,
     materialize_episode,
+    optimizer_step,
     prepare_episodes,
+    set_gradient_checkpointing,
     task_loss,
 )
 
@@ -108,6 +110,60 @@ def test_prepare_episodes_retains_only_cached_references(tmp_path, monkeypatch):
     assert all(isinstance(episode, CachedEpisode) for episode in episodes)
     assert [episode.race_id for episode in episodes] == ["0", "1", "2"]
     assert len(list(tmp_path.glob("*.npy"))) == 3
+
+
+def test_gradient_checkpointing_toggle_reaches_nested_encoders():
+    class RecomputingModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.recompute = False
+
+    model = torch.nn.Sequential(
+        RecomputingModule(),
+        torch.nn.Sequential(RecomputingModule()),
+    )
+
+    assert set_gradient_checkpointing(model, True) == 2
+    assert model[0].recompute is True
+    assert model[1][0].recompute is True
+    assert set_gradient_checkpointing(model, False) == 2
+    assert model[0].recompute is False
+    assert model[1][0].recompute is False
+
+
+def test_optimizer_step_unscales_before_clipping_and_stepping():
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    parameter.grad = torch.tensor([8.0])
+    optimizer = torch.optim.SGD([parameter], lr=0.5)
+
+    class RecordingScaler:
+        def __init__(self):
+            self.calls = []
+
+        def unscale_(self, received_optimizer):
+            assert received_optimizer is optimizer
+            self.calls.append("unscale")
+            parameter.grad.div_(2)
+
+        def step(self, received_optimizer):
+            self.calls.append("step")
+            received_optimizer.step()
+
+        def update(self):
+            self.calls.append("update")
+
+    scaler = RecordingScaler()
+    optimizer_step(
+        optimizer,
+        [parameter],
+        accumulated=4,
+        grad_clip=0,
+        grad_scaler=scaler,
+    )
+
+    assert scaler.calls == ["unscale", "step", "update"]
+    assert parameter.item() == pytest.approx(0.5)
+    assert parameter.grad is None
 
 
 @pytest.mark.parametrize("listwise_weight", [0.0, 0.25])

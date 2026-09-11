@@ -7,7 +7,7 @@ are never passed to the model as features.
 
 from __future__ import annotations
 
-from argparse import ArgumentParser
+from argparse import ArgumentParser, BooleanOptionalAction
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import gc
@@ -135,6 +135,12 @@ def parse_args():
     parser.add_argument("--patience", type=positive_integer, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--amp",
+        action=BooleanOptionalAction,
+        default=None,
+        help="use CUDA FP16 mixed precision (default: enabled on CUDA)",
+    )
     parser.add_argument("--num-threads", type=positive_integer, default=None)
     parser.add_argument(
         "--preprocessing-workers",
@@ -500,18 +506,65 @@ def task_loss(logits, targets, listwise_weight):
     return cross_entropy + listwise_weight * listwise, cross_entropy, listwise
 
 
-def optimizer_step(optimizer, trainable_parameters, accumulated, grad_clip):
+def set_gradient_checkpointing(model, enabled):
+    """Toggle recomputation on every encoder that exposes the setting."""
+    changed = 0
+    for module in model.modules():
+        if hasattr(module, "recompute"):
+            module.recompute = enabled
+            changed += 1
+    return changed
+
+
+def make_grad_scaler(enabled):
+    """Construct a CUDA scaler across supported PyTorch AMP API versions."""
+    if not enabled:
+        return None
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        try:
+            return torch.amp.GradScaler("cuda", enabled=True)
+        except TypeError:
+            pass
+    return torch.cuda.amp.GradScaler(enabled=True)
+
+
+def optimizer_step(
+    optimizer,
+    trainable_parameters,
+    accumulated,
+    grad_clip,
+    grad_scaler=None,
+):
+    if grad_scaler is not None:
+        grad_scaler.unscale_(optimizer)
     for parameter in trainable_parameters:
         if parameter.grad is not None:
             parameter.grad.div_(accumulated)
     if grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(trainable_parameters, grad_clip)
-    optimizer.step()
+    if grad_scaler is None:
+        optimizer.step()
+    else:
+        grad_scaler.step(optimizer)
+        grad_scaler.update()
     optimizer.zero_grad(set_to_none=True)
 
 
-def train_epoch(model, episodes, optimizer, trainable_parameters, args, epoch):
+def train_epoch(
+    model,
+    episodes,
+    optimizer,
+    trainable_parameters,
+    args,
+    epoch,
+    grad_scaler=None,
+):
     model.train()
+    if args.resolved_device.type == "cuda":
+        torch.cuda.empty_cache()
+    checkpointed_modules = set_gradient_checkpointing(
+        model, args.finetune_mode != "decoder"
+    )
     optimizer.zero_grad(set_to_none=True)
     rng = np.random.default_rng(args.seed + epoch)
     order = rng.permutation(len(episodes))
@@ -529,10 +582,17 @@ def train_epoch(model, episodes, optimizer, trainable_parameters, args, epoch):
             f"{len(batches)} batches (mean={mean_batch_size:.2f}, "
             f"maximum={batch_size})"
         )
-    objective_losses = []
-    cross_entropy_losses = []
-    listwise_losses = []
-    auxiliary_losses = []
+        print(
+            f"Gradient checkpointing: "
+            f"{'enabled' if args.finetune_mode != 'decoder' else 'disabled'} "
+            f"for {checkpointed_modules} modules"
+        )
+    metric_totals = {
+        "objective": None,
+        "cross_entropy": None,
+        "listwise": None,
+        "moe_aux": None,
+    }
     accumulated = 0
 
     for position, batch_indices in enumerate(batches, start=1):
@@ -543,39 +603,58 @@ def train_epoch(model, episodes, optimizer, trainable_parameters, args, epoch):
             rng=rng,
             shuffle_runners=not args.no_runner_shuffle,
         )
-        logits = model(X, y_train=y_context, embed_with_test=False)
-        loss, cross_entropy, listwise = task_loss(logits, y_query, args.listwise_weight)
-        auxiliary = loss.new_zeros(())
-        if args.finetune_mode != "decoder" and args.moe_aux_weight > 0:
-            auxiliary = model.moe_aux_loss()
-            loss = loss + args.moe_aux_weight * auxiliary
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+            enabled=getattr(args, "amp", False),
+        ):
+            logits = model(X, y_train=y_context, embed_with_test=False)
+            loss, cross_entropy, listwise = task_loss(
+                logits, y_query, args.listwise_weight
+            )
+            auxiliary = loss.new_zeros(())
+            if args.finetune_mode != "decoder" and args.moe_aux_weight > 0:
+                auxiliary = model.moe_aux_loss()
+                loss = loss + args.moe_aux_weight * auxiliary
         if not torch.isfinite(loss):
             race_ids = ", ".join(episode.race_id for episode in batch_episodes)
             raise RuntimeError(f"Non-finite training loss for query race batch: {race_ids}")
 
         episodes_in_batch = len(batch_episodes)
-        (loss * episodes_in_batch).backward()
-        objective_losses.append(loss.detach() * episodes_in_batch)
-        cross_entropy_losses.append(cross_entropy.detach() * episodes_in_batch)
-        listwise_losses.append(listwise.detach() * episodes_in_batch)
-        auxiliary_losses.append(auxiliary.detach() * episodes_in_batch)
+        scaled_loss = loss * episodes_in_batch
+        if grad_scaler is None:
+            scaled_loss.backward()
+        else:
+            grad_scaler.scale(scaled_loss).backward()
+        for name, value in {
+            "objective": loss,
+            "cross_entropy": cross_entropy,
+            "listwise": listwise,
+            "moe_aux": auxiliary,
+        }.items():
+            value = value.detach().float() * episodes_in_batch
+            if metric_totals[name] is None:
+                metric_totals[name] = value
+            else:
+                metric_totals[name].add_(value)
         accumulated += episodes_in_batch
 
         if accumulated >= args.gradient_accumulation or position == len(batches):
-            optimizer_step(optimizer, trainable_parameters, accumulated, args.grad_clip)
+            optimizer_step(
+                optimizer,
+                trainable_parameters,
+                accumulated,
+                args.grad_clip,
+                grad_scaler,
+            )
             accumulated = 0
     episode_count = len(episodes)
-    return {
-        "objective": float(torch.stack(objective_losses).sum().cpu() / episode_count),
-        "cross_entropy": float(torch.stack(cross_entropy_losses).sum().cpu() / episode_count),
-        "listwise": float(torch.stack(listwise_losses).sum().cpu() / episode_count),
-        "moe_aux": float(torch.stack(auxiliary_losses).sum().cpu() / episode_count),
-    }
+    return {name: float(total.cpu() / episode_count) for name, total in metric_totals.items()}
 
 
-def build_inference_config(device):
+def build_inference_config(device, use_amp=False):
     config = InferenceConfig()
-    common = {"device": device, "use_amp": False, "use_fa3": False}
+    common = {"device": device, "use_amp": use_amp, "use_fa3": False}
     config.update_from_dict(
         {
             "COL_CONFIG": dict(common),
@@ -604,7 +683,7 @@ def evaluate(model, episodes, device, inference_config, batch_size=1):
             y_train=y_context,
             embed_with_test=False,
             inference_config=inference_config,
-        )[..., :2]
+        )[..., :2].float()
         per_row_losses = F.cross_entropy(
             logits.reshape(-1, 2), y_query.reshape(-1), reduction="none"
         ).view(len(batch_episodes), -1)
@@ -767,23 +846,36 @@ def run(args, episode_cache_root):
 
     seed_everything(args.seed)
     args.resolved_device = resolve_device(args.device)
+    if args.amp is None:
+        args.amp = args.resolved_device.type == "cuda"
+    elif args.amp and args.resolved_device.type != "cuda":
+        raise ValueError("--amp requires a CUDA device; use --no-amp on CPU")
     if args.num_threads is not None:
         torch.set_num_threads(args.num_threads)
     model, source_checkpoint, source_path = load_model(args.checkpoint, args.resolved_device)
     trainable_parameters = configure_finetuning(model, args.finetune_mode)
-    inference_config = build_inference_config(args.resolved_device)
+    inference_config = build_inference_config(args.resolved_device, use_amp=args.amp)
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
     trainable_count = sum(parameter.numel() for parameter in trainable_parameters)
     print(f"Checkpoint: {source_path}")
     print(
         f"Device: {args.resolved_device}; mode={args.finetune_mode}; "
+        f"amp={'fp16' if args.amp else 'off'}; "
         f"trainable={trainable_count:,}/{total_parameters:,} parameters ({trainable_count / total_parameters:.2%})"
     )
 
-    optimizer = torch.optim.AdamW(trainable_parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        trainable_parameters,
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+        foreach=False,
+    )
+    grad_scaler = make_grad_scaler(args.amp)
     history = []
     baseline_validation = evaluate(model, validation_episodes, args.resolved_device, inference_config)
     print(f"Pretrained validation: {format_metrics(baseline_validation)}")
+    if args.resolved_device.type == "cuda":
+        torch.cuda.empty_cache()
     best_score = checkpoint_score(baseline_validation)
     best_epoch = 0
     stale_epochs = 0
@@ -792,7 +884,15 @@ def run(args, episode_cache_root):
         best_parameters_path = Path(temporary_directory) / "best-trainable.pt"
         save_trainable_parameters(model, best_parameters_path)
         for epoch in range(1, args.epochs + 1):
-            train_metrics = train_epoch(model, train_episodes, optimizer, trainable_parameters, args, epoch)
+            train_metrics = train_epoch(
+                model,
+                train_episodes,
+                optimizer,
+                trainable_parameters,
+                args,
+                epoch,
+                grad_scaler,
+            )
             validation_metrics = evaluate(
                 model, validation_episodes, args.resolved_device, inference_config
             )
@@ -839,6 +939,7 @@ def run(args, episode_cache_root):
         "finetune_mode": args.finetune_mode,
         "context_races": args.context_races,
         "preprocessing_workers": args.preprocessing_workers,
+        "amp": args.amp,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "listwise_weight": args.listwise_weight,
