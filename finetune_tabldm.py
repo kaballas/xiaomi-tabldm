@@ -10,6 +10,7 @@ from __future__ import annotations
 from argparse import ArgumentParser
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import gc
 import multiprocessing
 from pathlib import Path
 import json
@@ -49,6 +50,21 @@ class Episode:
     y_context: np.ndarray
     context_sizes: tuple[int, ...]
     X_query: np.ndarray
+    y_query: np.ndarray
+    winner_query: np.ndarray
+
+
+@dataclass
+class CachedEpisode:
+    """Lightweight reference to feature arrays stored outside process memory."""
+
+    race_id: str
+    feature_path: Path
+    context_rows: int
+    query_rows: int
+    feature_count: int
+    y_context: np.ndarray
+    context_sizes: tuple[int, ...]
     y_query: np.ndarray
     winner_query: np.ndarray
 
@@ -252,14 +268,66 @@ def prepare_episode(context_races, query_race, feature_columns):
 
 _PREPROCESSING_SPECS = None
 _PREPROCESSING_FEATURE_COLUMNS = None
+_PREPROCESSING_CACHE_DIR = None
+
+
+def cache_episode(episode, cache_dir, index):
+    """Persist the large feature matrix and retain only small episode metadata."""
+    feature_path = Path(cache_dir) / f"{index:08d}.npy"
+    features = np.concatenate([episode.X_context, episode.X_query], axis=0)
+    np.save(feature_path, features, allow_pickle=False)
+    return CachedEpisode(
+        race_id=episode.race_id,
+        feature_path=feature_path,
+        context_rows=len(episode.X_context),
+        query_rows=len(episode.X_query),
+        feature_count=episode.X_context.shape[1],
+        y_context=episode.y_context,
+        context_sizes=episode.context_sizes,
+        y_query=episode.y_query,
+        winner_query=episode.winner_query,
+    )
+
+
+def materialize_episode(episode):
+    """Load one cached episode lazily for the duration of a minibatch."""
+    if not isinstance(episode, CachedEpisode):
+        return episode
+    features = np.load(episode.feature_path, mmap_mode="r", allow_pickle=False)
+    expected_shape = (
+        episode.context_rows + episode.query_rows,
+        episode.feature_count,
+    )
+    if features.shape != expected_shape:
+        raise ValueError(
+            f"Cached episode {episode.race_id} has shape {features.shape}, "
+            f"expected {expected_shape}"
+        )
+    return Episode(
+        race_id=episode.race_id,
+        X_context=features[: episode.context_rows],
+        y_context=episode.y_context,
+        context_sizes=episode.context_sizes,
+        X_query=features[episode.context_rows :],
+        y_query=episode.y_query,
+        winner_query=episode.winner_query,
+    )
 
 
 def _prepare_episode_at_index(index):
     context, query = _PREPROCESSING_SPECS[index]
-    return prepare_episode(context, query, _PREPROCESSING_FEATURE_COLUMNS)
+    episode = prepare_episode(context, query, _PREPROCESSING_FEATURE_COLUMNS)
+    if _PREPROCESSING_CACHE_DIR is not None:
+        return cache_episode(episode, _PREPROCESSING_CACHE_DIR, index)
+    return episode
 
 
-def prepare_episodes(specs, feature_columns, label, workers=1):
+def prepare_episodes(specs, feature_columns, label, workers=1, cache_dir=None):
+    if not specs:
+        return []
+    if cache_dir is not None:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
     worker_count = min(workers, len(specs))
     if worker_count > 1:
         try:
@@ -268,17 +336,23 @@ def prepare_episodes(specs, feature_columns, label, workers=1):
             worker_count = 1
 
     if worker_count == 1:
-        iterator = (
-            prepare_episode(context_races, query_race, feature_columns)
-            for context_races, query_race in specs
-        )
+        def serial_iterator():
+            for index, (context_races, query_race) in enumerate(specs):
+                episode = prepare_episode(context_races, query_race, feature_columns)
+                if cache_dir is not None:
+                    episode = cache_episode(episode, cache_dir, index)
+                yield episode
+
+        iterator = serial_iterator()
         pool = None
     else:
-        global _PREPROCESSING_SPECS, _PREPROCESSING_FEATURE_COLUMNS
+        global _PREPROCESSING_SPECS, _PREPROCESSING_FEATURE_COLUMNS, _PREPROCESSING_CACHE_DIR
         _PREPROCESSING_SPECS = specs
         _PREPROCESSING_FEATURE_COLUMNS = feature_columns
+        _PREPROCESSING_CACHE_DIR = cache_dir
         pool = context.Pool(processes=worker_count)
-        chunk_size = max(1, min(32, len(specs) // (worker_count * 8)))
+        # Episode payloads are large; small chunks keep worker transients bounded.
+        chunk_size = max(1, min(4, len(specs) // (worker_count * 8)))
         iterator = pool.imap(_prepare_episode_at_index, range(len(specs)), chunksize=chunk_size)
 
     episodes = []
@@ -298,6 +372,7 @@ def prepare_episodes(specs, feature_columns, label, workers=1):
             pool.join()
             _PREPROCESSING_SPECS = None
             _PREPROCESSING_FEATURE_COLUMNS = None
+            _PREPROCESSING_CACHE_DIR = None
     return episodes
 
 
@@ -358,6 +433,8 @@ def episode_tensors(episode, device, rng=None, shuffle_runners=False):
 
 def episode_batch_key(episode):
     """Return dimensions that must match before episodes can be stacked."""
+    if isinstance(episode, CachedEpisode):
+        return episode.context_rows, episode.query_rows, episode.feature_count
     if episode.X_context.ndim != 2 or episode.X_query.ndim != 2:
         raise ValueError("Episode feature arrays must be two-dimensional")
     if episode.X_context.shape[1] != episode.X_query.shape[1]:
@@ -392,6 +469,7 @@ def episode_batches(episodes, batch_size, order=None):
 
 def episode_batch_tensors(episodes, device, rng=None, shuffle_runners=False):
     """Stack a shape-compatible group of episodes and move it to a device."""
+    episodes = [materialize_episode(episode) for episode in episodes]
     arrays = [
         shuffled_episode_arrays(episode, rng, shuffle_runners)
         for episode in episodes
@@ -519,7 +597,7 @@ def evaluate(model, episodes, device, inference_config, batch_size=1):
     hit_counts = []
 
     for batch_indices in episode_batches(episodes, batch_size):
-        batch_episodes = [episodes[index] for index in batch_indices]
+        batch_episodes = [materialize_episode(episodes[index]) for index in batch_indices]
         X, y_context, y_query = episode_batch_tensors(batch_episodes, device)
         logits = model(
             X,
@@ -654,17 +732,47 @@ def main():
     print(f"Chronological races: {split_summary}; context={args.context_races} race(s)")
     print(f"Configured features: {len(feature_columns)} from {args.features_json}")
     print(f"Episode preprocessing workers: {args.preprocessing_workers}")
+
+    # A 100-race context produces roughly 1.8 MB of float32 features per
+    # episode. Keeping every episode resident can exceed 12 GB for this
+    # dataset, so cache features beside the output checkpoint and load only a
+    # minibatch at a time. TemporaryDirectory removes the cache on normal exit
+    # and during exception unwinding.
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    episode_cache = tempfile.TemporaryDirectory(
+        prefix=".tabldm-episodes-",
+        dir=args.output.parent,
+    )
+    episode_cache_root = Path(episode_cache.name)
+    print(f"Episode feature cache: {episode_cache_root}")
     train_episodes = prepare_episodes(
-        train_specs, feature_columns, "training", args.preprocessing_workers
+        train_specs,
+        feature_columns,
+        "training",
+        args.preprocessing_workers,
+        episode_cache_root / "training",
     )
     validation_episodes = prepare_episodes(
-        validation_specs, feature_columns, "validation", args.preprocessing_workers
+        validation_specs,
+        feature_columns,
+        "validation",
+        args.preprocessing_workers,
+        episode_cache_root / "validation",
     )
     test_episodes = (
-        prepare_episodes(test_specs, feature_columns, "test", args.preprocessing_workers)
+        prepare_episodes(
+            test_specs,
+            feature_columns,
+            "test",
+            args.preprocessing_workers,
+            episode_cache_root / "test",
+        )
         if test_specs is not None
         else None
     )
+    del train_specs, validation_specs, test_specs
+    del train_races, validation_races, test_races
+    gc.collect()
 
     seed_everything(args.seed)
     args.resolved_device = resolve_device(args.device)
@@ -760,6 +868,7 @@ def main():
         save_finetuned_checkpoint(model, source_checkpoint, args.output, metadata)
         print(f"Saved fine-tuned checkpoint: {args.output}")
         print(f"Saved training metadata: {args.output.with_suffix(args.output.suffix + '.json')}")
+    episode_cache.cleanup()
 
 
 if __name__ == "__main__":

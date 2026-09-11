@@ -371,7 +371,7 @@ compared on validation data. To predict with the selected fine-tuned decoder:
 
 ```bash
 python predict_scratch_model.py \
-  --checkpoint results/tabldm_horse_scratch_finetuned.ckpt \
+  --checkpoint /home/theo/xiaomi-tabldm/results/clf_default.ckpt \
   --context-races 100 \
   --kv-cache kv \
   --device cpu

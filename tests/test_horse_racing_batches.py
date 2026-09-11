@@ -9,10 +9,14 @@ torch = pytest.importorskip("torch")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from finetune_tabldm import (  # noqa: E402
+    CachedEpisode,
     Episode,
+    cache_episode,
     episode_batch_key,
     episode_batch_tensors,
     episode_batches,
+    materialize_episode,
+    prepare_episodes,
     task_loss,
 )
 
@@ -63,6 +67,47 @@ def test_episode_batch_tensors_stack_on_batch_dimension():
     assert y_query.shape == (2, 3)
     np.testing.assert_array_equal(X[0, :4].numpy(), episodes[0].X_context)
     np.testing.assert_array_equal(X[1, 4:].numpy(), episodes[1].X_query)
+
+
+def test_cached_episode_round_trip_and_batch_loading(tmp_path):
+    episode = make_episode("cached", 4, 3, 2)
+
+    cached = cache_episode(episode, tmp_path, 7)
+
+    assert isinstance(cached, CachedEpisode)
+    assert cached.feature_path == tmp_path / "00000007.npy"
+    assert episode_batch_key(cached) == (4, 3, 2)
+    restored = materialize_episode(cached)
+    np.testing.assert_array_equal(restored.X_context, episode.X_context)
+    np.testing.assert_array_equal(restored.X_query, episode.X_query)
+    X, y_context, y_query = episode_batch_tensors([cached], torch.device("cpu"))
+    np.testing.assert_array_equal(X[0, :4].numpy(), episode.X_context)
+    np.testing.assert_array_equal(y_context[0].numpy(), episode.y_context)
+    np.testing.assert_array_equal(y_query[0].numpy(), episode.y_query)
+
+
+def test_prepare_episodes_retains_only_cached_references(tmp_path, monkeypatch):
+    import finetune_tabldm
+
+    prepared = [make_episode(index, 4, 3, 2, offset=index) for index in range(3)]
+    specs = [((), index) for index in range(3)]
+
+    monkeypatch.setattr(
+        finetune_tabldm,
+        "prepare_episode",
+        lambda _context, query, _features: prepared[query],
+    )
+    episodes = prepare_episodes(
+        specs,
+        ["feature"],
+        "test",
+        workers=1,
+        cache_dir=tmp_path,
+    )
+
+    assert all(isinstance(episode, CachedEpisode) for episode in episodes)
+    assert [episode.race_id for episode in episodes] == ["0", "1", "2"]
+    assert len(list(tmp_path.glob("*.npy"))) == 3
 
 
 @pytest.mark.parametrize("listwise_weight", [0.0, 0.25])
