@@ -689,8 +689,7 @@ def save_finetuned_checkpoint(model, source_checkpoint, output_path, metadata):
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
-def main():
-    args = parse_args()
+def run(args, episode_cache_root):
     if args.learning_rate is None:
         args.learning_rate = 1e-4 if args.finetune_mode == "decoder" else 1e-5
 
@@ -735,15 +734,7 @@ def main():
 
     # A 100-race context produces roughly 1.8 MB of float32 features per
     # episode. Keeping every episode resident can exceed 12 GB for this
-    # dataset, so cache features beside the output checkpoint and load only a
-    # minibatch at a time. TemporaryDirectory removes the cache on normal exit
-    # and during exception unwinding.
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    episode_cache = tempfile.TemporaryDirectory(
-        prefix=".tabldm-episodes-",
-        dir=args.output.parent,
-    )
-    episode_cache_root = Path(episode_cache.name)
+    # dataset, so cache features and load only a minibatch at a time.
     print(f"Episode feature cache: {episode_cache_root}")
     train_episodes = prepare_episodes(
         train_specs,
@@ -868,7 +859,18 @@ def main():
         save_finetuned_checkpoint(model, source_checkpoint, args.output, metadata)
         print(f"Saved fine-tuned checkpoint: {args.output}")
         print(f"Saved training metadata: {args.output.with_suffix(args.output.suffix + '.json')}")
-    episode_cache.cleanup()
+
+
+def main():
+    args = parse_args()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    # Keep the disk cache alive through preprocessing, evaluation, and every
+    # epoch, and remove it reliably after success, failure, or Ctrl-C.
+    with tempfile.TemporaryDirectory(
+        prefix=".tabldm-episodes-",
+        dir=args.output.parent,
+    ) as episode_cache_directory:
+        run(args, Path(episode_cache_directory))
 
 
 if __name__ == "__main__":
